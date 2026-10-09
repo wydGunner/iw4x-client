@@ -517,6 +517,58 @@ namespace Components
 				Game::Scr_AddBool((ent->client->flags & Game::CF_BIT_FROZEN) != 0);
 			});
 
+		// ---------------------------------------------------------------------
+		// Trickshot weapon-state methods, restored to match the behaviour of the
+		// older custom IW4x build (reverse-engineered from its handlers).
+		// Both hands (weapState[0] = right, weapState[1] = left) are written,
+		// exactly as the old build did. Extra arguments are accepted and ignored
+		// so existing scripts like `self setWeaponAnim(24, 2);` keep working.
+		// ---------------------------------------------------------------------
+
+		// self setWeaponAnim(<anim>);
+		GSC::Script::AddMethod("SetWeaponAnim", [](const Game::scr_entref_t entref)
+			{
+				auto* ent = GSC::Script::Scr_GetPlayerEntity(entref);
+				const auto anim = Game::Scr_GetInt(0);
+				ent->client->ps.weapState[Game::WEAPON_HAND_RIGHT].weapAnim = anim;
+				ent->client->ps.weapState[Game::WEAPON_HAND_LEFT].weapAnim = anim;
+			});
+
+		// self setWeaponAnimTime(<ms>);
+		GSC::Script::AddMethod("SetWeaponAnimTime", [](const Game::scr_entref_t entref)
+			{
+				auto* ent = GSC::Script::Scr_GetPlayerEntity(entref);
+				const auto time = Game::Scr_GetInt(0);
+				ent->client->ps.weapState[Game::WEAPON_HAND_RIGHT].weaponTime = time;
+				ent->client->ps.weapState[Game::WEAPON_HAND_LEFT].weaponTime = time;
+			});
+
+		// self setWeaponIdleTime(<ms>);
+		GSC::Script::AddMethod("SetWeaponIdleTime", [](const Game::scr_entref_t entref)
+			{
+				auto* ent = GSC::Script::Scr_GetPlayerEntity(entref);
+				ent->client->ps.weapCommon.weaponIdleTime = Game::Scr_GetInt(0);
+			});
+
+		// anim = self getWeaponAnim();
+		GSC::Script::AddMethod("GetWeaponAnim", [](const Game::scr_entref_t entref)
+			{
+				const auto* ent = GSC::Script::Scr_GetPlayerEntity(entref);
+				Game::Scr_AddInt(ent->client->ps.weapState[Game::WEAPON_HAND_RIGHT].weapAnim);
+			});
+
+		// self instashoot();  - weapon ready immediately, no delay/timer
+		GSC::Script::AddMethod("Instashoot", [](const Game::scr_entref_t entref)
+			{
+				auto* ent = GSC::Script::Scr_GetPlayerEntity(entref);
+				for (auto& ws : ent->client->ps.weapState)
+				{
+					ws.weaponState = Game::WEAPON_READY;
+					ws.weaponTime = 0;
+					ws.weaponDelay = 0;
+				}
+			});
+
 		GSC::Script::AddMethod("InitialWeaponRaise", PlayerCmd_InitialWeaponRaise);
 		GSC::Script::AddMethod("FreezeControlsAllowLook", PlayerCmd_FreezeControlsAllowLook);
 	}
