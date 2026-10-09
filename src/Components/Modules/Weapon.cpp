@@ -569,6 +569,73 @@ namespace Components
 				}
 			});
 
+		// ---------------------------------------------------------------------
+		// weapdef_* functions, restored from the same older custom build.
+		// They edit the loaded weapon definition for EVERY player using that
+		// weapon until the map restarts. Usage: weapdef_<x>(<weaponName>, <value>)
+		// ---------------------------------------------------------------------
+		static const auto getWeaponDefArg = []() -> Game::WeaponDef*
+		{
+			const auto* name = Game::Scr_GetString(0);
+			const auto index = Game::G_GetWeaponIndexForName(name);
+			if (!index)
+			{
+				// Print instead of Scr_Error so a typo doesn't kill the calling script thread
+				Logger::Print("weapdef: unknown weapon '{}'\n", name ? name : "");
+				return nullptr;
+			}
+			return Game::BG_GetWeaponDef(index);
+		};
+
+		// weapdef_forcecowboy(<weapon>, <maxPitch>)  - fGunMaxPitch
+		GSC::Script::AddFunction("weapdef_forcecowboy", []
+			{
+				if (auto* def = getWeaponDefArg()) def->fGunMaxPitch = Game::Scr_GetFloat(1);
+			});
+
+		// weapdef_quickdroptime(<weapon>, <ms>)
+		GSC::Script::AddFunction("weapdef_quickdroptime", []
+			{
+				if (auto* def = getWeaponDefArg()) def->quickDropTime = Game::Scr_GetInt(1);
+			});
+
+		// weapdef_droptime(<weapon>, <ms>)
+		GSC::Script::AddFunction("weapdef_droptime", []
+			{
+				if (auto* def = getWeaponDefArg()) def->iDropTime = Game::Scr_GetInt(1);
+			});
+
+		// weapdef_holdfiretime(<weapon>, <ms>)
+		GSC::Script::AddFunction("weapdef_holdfiretime", []
+			{
+				if (auto* def = getWeaponDefArg()) def->iHoldFireTime = Game::Scr_GetInt(1);
+			});
+
+		// weapdef_sprintintime(<weapon>, <ms>)
+		GSC::Script::AddFunction("weapdef_sprintintime", []
+			{
+				if (auto* def = getWeaponDefArg()) def->sprintInTime = Game::Scr_GetInt(1);
+			});
+
+		// weapdef_reloadTime(<weapon>, <ms>)
+		GSC::Script::AddFunction("weapdef_reloadTime", []
+			{
+				if (auto* def = getWeaponDefArg()) def->iReloadTime = Game::Scr_GetInt(1);
+			});
+
+		// weapdef_kickback(<weapon>, <pitch>)  - same value for hip & ADS min/max
+		GSC::Script::AddFunction("weapdef_kickback", []
+			{
+				if (auto* def = getWeaponDefArg())
+				{
+					const auto v = Game::Scr_GetFloat(1);
+					def->fHipGunKickPitchMax = v;
+					def->fHipGunKickPitchMin = v;
+					def->fAdsGunKickPitchMax = v;
+					def->fAdsGunKickPitchMin = v;
+				}
+			});
+
 		GSC::Script::AddMethod("InitialWeaponRaise", PlayerCmd_InitialWeaponRaise);
 		GSC::Script::AddMethod("FreezeControlsAllowLook", PlayerCmd_FreezeControlsAllowLook);
 	}
