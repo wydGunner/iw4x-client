@@ -42,6 +42,12 @@ namespace Components
 		static void PlayerCmd_FreezeControlsAllowLook(Game::scr_entref_t entref);
 
 		static void AddScriptMethods();
+		// Viewmodel anim clip player
+		static void AnimClip_Play(unsigned int anim, float startPct, float endPct, float speed, bool freezeAtEnd);
+		static void AnimClip_Stop();
+		static void AnimClip_Frame(Game::playerState_s* ps, int hand);
+		static void WeaponRunXModelAnims_Stub();
+		static void AddAnimClip();
 
 		static void PM_Weapon_stub(Game::pmove_s* pm, Game::pml_t* pml);
 	};

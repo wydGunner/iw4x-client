@@ -640,6 +640,244 @@ namespace Components
 		GSC::Script::AddMethod("FreezeControlsAllowLook", PlayerCmd_FreezeControlsAllowLook);
 	}
 
+	// =====================================================================
+	// Viewmodel anim clip player
+	// ---------------------------------------------------------------------
+	// Plays one viewmodel animation from <start>% to <end>% at <speed>x,
+	// optionally freezing on the end frame. Purely client-side (only the
+	// view of the local player running this DLL changes - firing, timers and
+	// the server never see it).
+	//
+	// Engine addresses (iw4x.exe, found by disassembly):
+	//   0x4D15C0  DObjGetTree(DObj*) -> XAnimTree_s*
+	//   0x444B90  XAnimSetGoalWeight(DObj*, anim, weight, goalTime, rate,
+	//                                notifyName, notifyType, restart)
+	//   0x4DC640  XAnimSetTime(XAnimTree_s*, anim, time)   time = 0..1
+	//   0x444AA0  XAnimGetTime(XAnimTree_s*, anim) -> float  0..1
+	//   0x59B5E0  WeaponRunXModelAnims  eax = hand, push playerState
+	//             (one call site: 0x47F55C, once per hand per frame)
+	//   0x9F5D28  per-hand viewmodel info, stride 0x14:
+	//             +0x0 DObj* (viewmodel), +0xC last weapAnim it started
+	// The game's own PlayADSAnim (0x59B420) uses this same trick: goal
+	// weight 1 at rate 0, then XAnimSetTime to scrub the ADS anims.
+	// =====================================================================
+	namespace
+	{
+		using DObjGetTree_t = Game::XAnimTree_s*(*)(Game::DObj* obj);
+		using XAnimSetGoalWeight_t = int(*)(Game::DObj* obj, unsigned int animIndex, float goalWeight, float goalTime, float rate, unsigned int notifyName, unsigned int notifyType, int restart);
+		using XAnimSetTime_t = void(*)(Game::XAnimTree_s* tree, unsigned int animIndex, float time);
+		using XAnimGetTime_t = float(*)(Game::XAnimTree_s* tree, unsigned int animIndex);
+
+		const auto DObjGetTree = reinterpret_cast<DObjGetTree_t>(0x4D15C0);
+		const auto XAnimSetGoalWeight = reinterpret_cast<XAnimSetGoalWeight_t>(0x444B90);
+		const auto XAnimSetTime = reinterpret_cast<XAnimSetTime_t>(0x4DC640);
+		const auto XAnimGetTime = reinterpret_cast<XAnimGetTime_t>(0x444AA0);
+
+		constexpr std::uintptr_t VIEWMODEL_HANDS = 0x9F5D28;
+		constexpr std::uintptr_t VIEWMODEL_HAND_SIZE = 0x14;
+		constexpr std::uintptr_t VIEWMODEL_HAND_PREV_ANIM = 0xC;
+
+		// Anims 1..36 are children of the VIEWMODEL tree (0 is root)
+		constexpr unsigned int CLIP_FIRST_ANIM = Game::WEAP_ANIM_IDLE;
+		constexpr unsigned int CLIP_LAST_ANIM = Game::NUM_WEAP_ANIMS - 1;
+
+		// Highest time we seek to; 1.0 wraps to 0 on looping anims
+		constexpr float CLIP_MAX_TIME = 0.999f;
+
+		struct
+		{
+			bool active;
+			bool frozen;
+			bool freezeAtEnd;
+			unsigned int anim;
+			float start;
+			float end;
+			float speed;
+			bool pendingStart[Game::NUM_WEAPON_HANDS];
+			float lastTime[Game::NUM_WEAPON_HANDS];
+		} animClip{};
+
+		std::uint8_t* GetViewmodelHand(const int hand)
+		{
+			return reinterpret_cast<std::uint8_t*>(VIEWMODEL_HANDS + hand * VIEWMODEL_HAND_SIZE);
+		}
+	}
+
+	void Weapon::AnimClip_Play(const unsigned int anim, const float startPct, const float endPct, const float speed, const bool freezeAtEnd)
+	{
+		if (anim < CLIP_FIRST_ANIM || anim > CLIP_LAST_ANIM)
+		{
+			Logger::Print("animclip: anim must be {}-{} (got {})\n", CLIP_FIRST_ANIM, CLIP_LAST_ANIM, anim);
+			return;
+		}
+
+		auto start = std::clamp(startPct, 0.0f, 100.0f) / 100.0f;
+		auto end = std::clamp(endPct, 0.0f, 100.0f) / 100.0f;
+		if (end <= start) end = 1.0f;
+
+		animClip.anim = anim;
+		animClip.start = std::min(start, CLIP_MAX_TIME);
+		animClip.end = std::min(end, CLIP_MAX_TIME);
+		animClip.speed = std::clamp(speed, 0.0f, 20.0f);
+		animClip.freezeAtEnd = freezeAtEnd;
+		animClip.frozen = false;
+
+		for (auto hand = 0; hand < Game::NUM_WEAPON_HANDS; ++hand)
+		{
+			animClip.pendingStart[hand] = true;
+			animClip.lastTime[hand] = animClip.start;
+		}
+
+		animClip.active = true;
+	}
+
+	void Weapon::AnimClip_Stop()
+	{
+		if (!animClip.active) return;
+
+		animClip.active = false;
+		animClip.frozen = false;
+
+		// Same thing the game does to force a re-sync: forget the last started
+		// anim so WeaponRunXModelAnims restarts whatever the player is doing.
+		for (auto hand = 0; hand < Game::NUM_WEAPON_HANDS; ++hand)
+		{
+			*reinterpret_cast<int*>(GetViewmodelHand(hand) + VIEWMODEL_HAND_PREV_ANIM) = -1;
+		}
+	}
+
+	void Weapon::AnimClip_Frame([[maybe_unused]] Game::playerState_s* ps, const int hand)
+	{
+		if (!animClip.active || hand < 0 || hand >= Game::NUM_WEAPON_HANDS) return;
+
+		auto* obj = *reinterpret_cast<Game::DObj**>(GetViewmodelHand(hand));
+		if (!obj || !obj->tree) return;
+
+		auto* tree = DObjGetTree(obj);
+		const auto anim = animClip.anim;
+		const auto begin = animClip.pendingStart[hand];
+		const auto rate = animClip.frozen ? 0.0f : animClip.speed;
+
+		// Runs right after the game's own anim update, so anything it just
+		// started this frame (fire, reload...) is overridden before drawing.
+		for (auto i = CLIP_FIRST_ANIM; i <= CLIP_LAST_ANIM; ++i)
+		{
+			if (i == anim)
+			{
+				XAnimSetGoalWeight(obj, i, 1.0f, 0.0f, rate, 0, 0, begin ? 1 : 0);
+			}
+			else
+			{
+				XAnimSetGoalWeight(obj, i, 0.0f, 0.0f, 1.0f, 0, 0, 0);
+			}
+		}
+
+		if (begin)
+		{
+			XAnimSetTime(tree, anim, animClip.start);
+			animClip.pendingStart[hand] = false;
+			animClip.lastTime[hand] = animClip.start;
+			return;
+		}
+
+		if (animClip.frozen)
+		{
+			XAnimSetTime(tree, anim, animClip.end);
+			return;
+		}
+
+		const auto time = XAnimGetTime(tree, anim);
+		const auto wrapped = (time + 0.5f) < animClip.lastTime[hand]; // looping anim passed 1.0
+		animClip.lastTime[hand] = time;
+
+		if (time >= animClip.end || wrapped)
+		{
+			if (animClip.freezeAtEnd)
+			{
+				animClip.frozen = true;
+				XAnimSetGoalWeight(obj, anim, 1.0f, 0.0f, 0.0f, 0, 0, 0);
+				XAnimSetTime(tree, anim, animClip.end);
+			}
+			else
+			{
+				AnimClip_Stop();
+			}
+		}
+	}
+
+	__declspec(naked) void Weapon::WeaponRunXModelAnims_Stub()
+	{
+		__asm
+		{
+			// entry: eax = hand, [esp] = return, [esp + 4] = playerState
+			push eax                    // save hand
+			push dword ptr [esp + 8]    // playerState
+			mov eax, [esp + 4]          // hand
+			mov ecx, 0x59B5E0           // WeaponRunXModelAnims
+			call ecx
+			add esp, 4
+
+			pop eax                     // hand
+			push eax
+			push dword ptr [esp + 8]    // playerState
+			call AnimClip_Frame         // (playerState, hand)
+			add esp, 8
+			ret
+		}
+	}
+
+	void Weapon::AddAnimClip()
+	{
+		// animClipPlay(<anim>, [startPct = 0], [endPct = 100], [speed = 1.0], [freeze = 0])
+		GSC::Script::AddFunction("AnimClipPlay", []
+			{
+				const auto numParams = Game::Scr_GetNumParam();
+				const auto anim = static_cast<unsigned int>(Game::Scr_GetInt(0));
+				const auto start = numParams > 1 ? Game::Scr_GetFloat(1) : 0.0f;
+				const auto end = numParams > 2 ? Game::Scr_GetFloat(2) : 100.0f;
+				const auto speed = numParams > 3 ? Game::Scr_GetFloat(3) : 1.0f;
+				const auto freeze = numParams > 4 ? Game::Scr_GetInt(4) != 0 : false;
+				AnimClip_Play(anim, start, end, speed, freeze);
+			});
+
+		// animClipStop();
+		GSC::Script::AddFunction("AnimClipStop", []
+			{
+				AnimClip_Stop();
+			});
+
+		// playing = animClipIsPlaying();
+		GSC::Script::AddFunction("AnimClipIsPlaying", []
+			{
+				Game::Scr_AddInt(animClip.active ? 1 : 0);
+			});
+
+		// Console: animclip <anim> [startPct] [endPct] [speed] [freeze]
+		Command::Add("animclip", [](const Command::Params* params)
+			{
+				if (params->size() < 2)
+				{
+					Logger::Print("usage: animclip <anim 1-36> [startPct 0-100] [endPct 0-100] [speed] [freeze 0/1]\n");
+					return;
+				}
+
+				const auto anim = static_cast<unsigned int>(std::strtoul(params->get(1), nullptr, 10));
+				const auto start = params->size() > 2 ? std::strtof(params->get(2), nullptr) : 0.0f;
+				const auto end = params->size() > 3 ? std::strtof(params->get(3), nullptr) : 100.0f;
+				const auto speed = params->size() > 4 ? std::strtof(params->get(4), nullptr) : 1.0f;
+				const auto freeze = params->size() > 5 ? std::strtoul(params->get(5), nullptr, 10) != 0 : false;
+				AnimClip_Play(anim, start, end, speed, freeze);
+			});
+
+		Command::Add("animclip_stop", []
+			{
+				AnimClip_Stop();
+			});
+
+		// WeaponRunXModelAnims call in CG_UpdateViewModel... (per hand, per frame)
+		Utils::Hook(0x47F55C, WeaponRunXModelAnims_Stub, HOOK_CALL).install()->quick();
+	}
+
 	void Weapon::PM_Weapon_stub(Game::pmove_s* pm, Game::pml_t* pml)
 	{
 		if (BGDisableDoubleTaps && BGDisableDoubleTaps->current.enabled)
@@ -722,5 +960,6 @@ namespace Components
 		Utils::Hook(0x4FB2D7, BG_WeaponFireRecoil_Stub, HOOK_CALL).install()->quick();
 
 		AddScriptMethods();
+		AddAnimClip();
 	}
 }
