@@ -1,6 +1,7 @@
 #include "Weapon.hpp"
 
 #include "GSC/Script.hpp"
+#include "Events.hpp"
 
 namespace Components
 {
@@ -641,12 +642,457 @@ namespace Components
 	}
 
 	// =====================================================================
-	// Viewmodel anim clip player
+	// Live weapon editing by weapon-file field name
 	// ---------------------------------------------------------------------
-	// Plays one viewmodel animation from <start>% to <end>% at <speed>x,
-	// optionally freezing on the end frame. Purely client-side (only the
-	// view of the local player running this DLL changes - firing, timers and
-	// the server never see it).
+	// WeapDefSet("ak47_mp", "reloadTime", 4.5) edits the loaded weapon the
+	// same way the weapon file would have set it - same names, same units
+	// (seconds for *Time fields), no restart. The first edit of a field
+	// remembers its original value so it can be read back / reset.
+	//
+	// The field list is the game's own weapon-file parse table, so any
+	// numeric field from a weapon file works (int, bool, float, seconds).
+	// Anim fields (fireAnim, meleeAnim, raiseAnim...) swap that anim in the
+	// weapon's viewmodel anim set, e.g. meleeAnim viewmodel_knife_melee_stab.
+	//
+	// Engine data (iw4x.exe, found by disassembly):
+	//   0x795F00  cspField_t[0x2A0] weapon field table {name, offset, type}
+	//             offsets are into the loader's flat "full def":
+	//               0x000 WeaponCompleteDef (0x74 bytes)
+	//               0x074 WeaponDef         (0x684 bytes)
+	//               0x738 szXAnims[37]      (anim name per weapAnimFiles_t)
+	//   0x4EF57A  operand of CG_RegisterWeapon's "lea edi,[edi*4+anims]"
+	//             -> per-weapon viewmodel XAnim_s* x3 (default/right/left).
+	//             IW4x relocates that array, so read the address from here.
+	//   0x4EF790  XAnimCreate(XAnim_s*, animIndex, name)
+	//             XAnim_s = { uint count; { u16 n; u16 pad; XAnimParts* parts } [count] }
+	//
+	// Notes
+	//  - WeaponDef fields (reload/rechamber/raise/drop/sprint times...) can
+	//    be shared by all attachment variants of a gun in the fastfiles, so
+	//    editing ak47_fmj_mp may also change ak47_mp. CompleteDef fields
+	//    (fireTime, firstRaiseTime, adsZoomFov) and anims are per variant.
+	//  - Edits live in this process: on a listen server they change both the
+	//    host's server and client. Other players' clients keep stock values.
+	//  - Everything resets on map load (weapons are reloaded from scratch).
+	// =====================================================================
+	namespace
+	{
+		constexpr std::uintptr_t WEAPON_FIELD_TABLE = 0x795F00;
+		constexpr int WEAPON_FIELD_COUNT = 0x2A0;
+
+		constexpr int FULLDEF_WEAPDEF = 0x74;
+		constexpr int FULLDEF_WEAPDEF_END = 0x74 + 0x684;
+		constexpr int FULLDEF_XANIMS = 0x738;
+
+		enum
+		{
+			CSPFT_STRING = 0,
+			CSPFT_INT = 4,
+			CSPFT_BOOL = 6,
+			CSPFT_FLOAT = 7,
+			CSPFT_MILLISECONDS = 9,
+		};
+
+		constexpr std::uintptr_t CG_WEAPON_ANIMS_OPERAND = 0x4EF57A;
+		constexpr int CG_WEAPON_ANIM_SETS = 3;
+
+		using XAnimCreate_t = void(*)(void* anims, unsigned int animIndex, const char* name);
+		const auto XAnimCreate = reinterpret_cast<XAnimCreate_t>(0x4EF790);
+
+		struct SavedValue
+		{
+			std::uint32_t value;
+			int size;
+		};
+
+		struct SavedAnim
+		{
+			std::uint32_t entry[2];
+		};
+
+		std::unordered_map<std::uintptr_t, SavedValue> weapDefOriginals;   // field address -> original
+		std::unordered_map<std::uintptr_t, SavedAnim> weapAnimOriginals;   // anim entry address -> original
+		std::unordered_map<std::uint64_t, std::string> weapAnimNames;      // (weapon << 32 | anim) -> current name
+
+		const Game::cspField_t* FindWeaponField(const char* name)
+		{
+			if (!name || !*name) return nullptr;
+
+			const auto* fields = reinterpret_cast<const Game::cspField_t*>(WEAPON_FIELD_TABLE);
+			for (auto i = 0; i < WEAPON_FIELD_COUNT; ++i)
+			{
+				if (fields[i].szName && !_stricmp(fields[i].szName, name))
+				{
+					return &fields[i];
+				}
+			}
+
+			return nullptr;
+		}
+
+		bool IsAnimField(const Game::cspField_t* field)
+		{
+			return field->iFieldType == CSPFT_STRING
+				&& field->iOffset >= FULLDEF_XANIMS
+				&& field->iOffset < FULLDEF_XANIMS + static_cast<int>(Game::NUM_WEAP_ANIMS) * 4;
+		}
+
+		bool IsNumericField(const Game::cspField_t* field)
+		{
+			switch (field->iFieldType)
+			{
+			case CSPFT_INT:
+			case CSPFT_BOOL:
+			case CSPFT_FLOAT:
+			case CSPFT_MILLISECONDS:
+				return field->iOffset >= 0 && field->iOffset < FULLDEF_WEAPDEF_END;
+			default:
+				return false;
+			}
+		}
+
+		// Map a full-def offset onto the live, separately allocated structs
+		std::uint8_t* GetFieldAddress(const unsigned int weapIndex, const Game::cspField_t* field)
+		{
+			auto* completeDef = Game::BG_GetWeaponCompleteDef(weapIndex);
+			if (!completeDef) return nullptr;
+
+			if (field->iOffset < FULLDEF_WEAPDEF)
+			{
+				return reinterpret_cast<std::uint8_t*>(completeDef) + field->iOffset;
+			}
+
+			if (field->iOffset < FULLDEF_WEAPDEF_END && completeDef->weapDef)
+			{
+				return reinterpret_cast<std::uint8_t*>(completeDef->weapDef) + (field->iOffset - FULLDEF_WEAPDEF);
+			}
+
+			return nullptr;
+		}
+
+		void SaveOriginal(std::uint8_t* address, const int size)
+		{
+			const auto key = reinterpret_cast<std::uintptr_t>(address);
+			if (weapDefOriginals.contains(key)) return;
+
+			SavedValue saved{};
+			saved.size = size;
+			std::memcpy(&saved.value, address, size);
+			weapDefOriginals.emplace(key, saved);
+		}
+
+		// Value in weapon-file units (seconds for ms fields)
+		float ReadNumeric(const std::uint8_t* address, const int type)
+		{
+			switch (type)
+			{
+			case CSPFT_BOOL: return *address ? 1.0f : 0.0f;
+			case CSPFT_FLOAT: return *reinterpret_cast<const float*>(address);
+			case CSPFT_MILLISECONDS: return static_cast<float>(*reinterpret_cast<const int*>(address)) / 1000.0f;
+			default: return static_cast<float>(*reinterpret_cast<const int*>(address));
+			}
+		}
+
+		void WriteNumeric(std::uint8_t* address, const int type, const float value)
+		{
+			switch (type)
+			{
+			case CSPFT_BOOL: *address = value != 0.0f ? 1 : 0; break;
+			case CSPFT_FLOAT: *reinterpret_cast<float*>(address) = value; break;
+			case CSPFT_MILLISECONDS: *reinterpret_cast<int*>(address) = static_cast<int>(std::lround(value * 1000.0f)); break;
+			default: *reinterpret_cast<int*>(address) = static_cast<int>(std::lround(value)); break;
+			}
+		}
+
+		std::uintptr_t* GetWeaponAnimSets(const unsigned int weapIndex)
+		{
+			const auto base = *reinterpret_cast<std::uintptr_t*>(CG_WEAPON_ANIMS_OPERAND);
+			return reinterpret_cast<std::uintptr_t*>(base + weapIndex * CG_WEAPON_ANIM_SETS * sizeof(std::uintptr_t));
+		}
+
+		// name == nullptr: restore the original anim
+		bool SwapWeaponAnim(const unsigned int weapIndex, const unsigned int animIndex, const char* name)
+		{
+			if (name && Game::DB_IsXAssetDefault(Game::ASSET_TYPE_XANIMPARTS, name))
+			{
+				Logger::Print("weapdef: anim '{}' is not loaded\n", name);
+				return false;
+			}
+
+			auto* sets = GetWeaponAnimSets(weapIndex);
+			auto swapped = false;
+
+			for (auto set = 0; set < CG_WEAPON_ANIM_SETS; ++set)
+			{
+				const auto anims = sets[set];
+				if (!anims) continue;
+				if (animIndex >= *reinterpret_cast<unsigned int*>(anims)) continue;
+
+				auto* entry = reinterpret_cast<std::uint32_t*>(anims + 4 + animIndex * 8);
+				const auto key = reinterpret_cast<std::uintptr_t>(entry);
+
+				if (!weapAnimOriginals.contains(key))
+				{
+					weapAnimOriginals.emplace(key, SavedAnim{ { entry[0], entry[1] } });
+				}
+
+				if (name)
+				{
+					XAnimCreate(reinterpret_cast<void*>(anims), animIndex, name);
+				}
+				else
+				{
+					const auto& saved = weapAnimOriginals[key];
+					entry[0] = saved.entry[0];
+					entry[1] = saved.entry[1];
+				}
+
+				swapped = true;
+			}
+
+			const auto nameKey = (static_cast<std::uint64_t>(weapIndex) << 32) | animIndex;
+			if (name) weapAnimNames[nameKey] = name;
+			else weapAnimNames.erase(nameKey);
+
+			if (!swapped)
+			{
+				Logger::Print("weapdef: weapon {} has no viewmodel anims registered yet\n", weapIndex);
+			}
+
+			return swapped;
+		}
+
+		const char* GetOriginalAnimName(const unsigned int weapIndex, const unsigned int animIndex)
+		{
+			const auto* completeDef = Game::BG_GetWeaponCompleteDef(weapIndex);
+			if (!completeDef || !completeDef->szXAnims || !completeDef->szXAnims[animIndex]) return "";
+			return completeDef->szXAnims[animIndex];
+		}
+
+		unsigned int GetWeaponArg(const unsigned int index)
+		{
+			const auto* name = Game::Scr_GetString(index);
+			const auto weapIndex = Game::G_GetWeaponIndexForName(name);
+			if (!weapIndex)
+			{
+				Logger::Print("weapdef: unknown weapon '{}'\n", name ? name : "");
+			}
+			return weapIndex;
+		}
+
+		const Game::cspField_t* GetFieldArg(const unsigned int index)
+		{
+			const auto* name = Game::Scr_GetString(index);
+			const auto* field = FindWeaponField(name);
+			if (!field || (!IsNumericField(field) && !IsAnimField(field)))
+			{
+				Logger::Print("weapdef: field '{}' is unknown or not editable live\n", name ? name : "");
+				return nullptr;
+			}
+			return field;
+		}
+	}
+
+	bool Weapon::WeapDef_Set(const unsigned int weapIndex, const char* fieldName, const char* value)
+	{
+		const auto* field = FindWeaponField(fieldName);
+		if (!weapIndex || !field || !value) return false;
+
+		if (IsAnimField(field))
+		{
+			const auto animIndex = static_cast<unsigned int>((field->iOffset - FULLDEF_XANIMS) / 4);
+			const auto restore = !*value || !_stricmp(value, "default");
+			return SwapWeaponAnim(weapIndex, animIndex, restore ? nullptr : value);
+		}
+
+		if (!IsNumericField(field)) return false;
+
+		auto* address = GetFieldAddress(weapIndex, field);
+		if (!address) return false;
+
+		SaveOriginal(address, field->iFieldType == CSPFT_BOOL ? 1 : 4);
+		WriteNumeric(address, field->iFieldType, std::strtof(value, nullptr));
+		return true;
+	}
+
+	void Weapon::WeapDef_Reset(const unsigned int weapIndex, const char* fieldName)
+	{
+		const auto* field = fieldName ? FindWeaponField(fieldName) : nullptr;
+
+		if (field)
+		{
+			if (IsAnimField(field))
+			{
+				const auto animIndex = static_cast<unsigned int>((field->iOffset - FULLDEF_XANIMS) / 4);
+				if (weapAnimNames.contains((static_cast<std::uint64_t>(weapIndex) << 32) | animIndex))
+				{
+					SwapWeaponAnim(weapIndex, animIndex, nullptr);
+				}
+				return;
+			}
+
+			auto* address = GetFieldAddress(weapIndex, field);
+			if (!address) return;
+
+			const auto it = weapDefOriginals.find(reinterpret_cast<std::uintptr_t>(address));
+			if (it == weapDefOriginals.end()) return;
+
+			std::memcpy(address, &it->second.value, it->second.size);
+			return;
+		}
+
+		// Whole weapon: every numeric field + every swapped anim
+		const auto* fields = reinterpret_cast<const Game::cspField_t*>(WEAPON_FIELD_TABLE);
+		for (auto i = 0; i < WEAPON_FIELD_COUNT; ++i)
+		{
+			if (!IsNumericField(&fields[i])) continue;
+			auto* address = GetFieldAddress(weapIndex, &fields[i]);
+			if (!address) continue;
+
+			const auto it = weapDefOriginals.find(reinterpret_cast<std::uintptr_t>(address));
+			if (it != weapDefOriginals.end())
+			{
+				std::memcpy(address, &it->second.value, it->second.size);
+			}
+		}
+
+		for (auto anim = 0u; anim < static_cast<unsigned int>(Game::NUM_WEAP_ANIMS); ++anim)
+		{
+			if (weapAnimNames.contains((static_cast<std::uint64_t>(weapIndex) << 32) | anim))
+			{
+				SwapWeaponAnim(weapIndex, anim, nullptr);
+			}
+		}
+	}
+
+	void Weapon::AddWeapDefEditing()
+	{
+		AssertSize(Game::WeaponCompleteDef, FULLDEF_WEAPDEF);
+		AssertSize(Game::WeaponDef, FULLDEF_WEAPDEF_END - FULLDEF_WEAPDEF);
+
+		// New map = weapons reloaded = old addresses meaningless
+		const auto clearSaved = []
+		{
+			weapDefOriginals.clear();
+			weapAnimOriginals.clear();
+			weapAnimNames.clear();
+		};
+		Events::OnSVInit(clearSaved);
+		Events::OnCGameInit(clearSaved);
+
+		// WeapDefSet(<weapon>, <field>, <value>)
+		//   numeric fields: number, seconds for *Time fields
+		//   anim fields:    anim name, or "" / "default" to restore
+		GSC::Script::AddFunction("WeapDefSet", []
+			{
+				const auto weapIndex = GetWeaponArg(0);
+				const auto* field = GetFieldArg(1);
+				if (!weapIndex || !field) return;
+
+				if (IsAnimField(field))
+				{
+					WeapDef_Set(weapIndex, field->szName, Game::Scr_GetString(2));
+				}
+				else
+				{
+					WeapDef_Set(weapIndex, field->szName, std::to_string(Game::Scr_GetFloat(2)).c_str());
+				}
+			});
+
+		// value = WeapDefGet(<weapon>, <field>, [original = 0])
+		GSC::Script::AddFunction("WeapDefGet", []
+			{
+				const auto weapIndex = GetWeaponArg(0);
+				const auto* field = GetFieldArg(1);
+				const auto original = Game::Scr_GetNumParam() > 2 && Game::Scr_GetInt(2) != 0;
+				if (!weapIndex || !field)
+				{
+					Game::Scr_AddInt(0);
+					return;
+				}
+
+				if (IsAnimField(field))
+				{
+					const auto animIndex = static_cast<unsigned int>((field->iOffset - FULLDEF_XANIMS) / 4);
+					const auto it = weapAnimNames.find((static_cast<std::uint64_t>(weapIndex) << 32) | animIndex);
+					Game::Scr_AddString(!original && it != weapAnimNames.end() ? it->second.c_str() : GetOriginalAnimName(weapIndex, animIndex));
+					return;
+				}
+
+				auto* address = GetFieldAddress(weapIndex, field);
+				if (!address)
+				{
+					Game::Scr_AddInt(0);
+					return;
+				}
+
+				if (original)
+				{
+					const auto it = weapDefOriginals.find(reinterpret_cast<std::uintptr_t>(address));
+					if (it != weapDefOriginals.end())
+					{
+						Game::Scr_AddFloat(ReadNumeric(reinterpret_cast<const std::uint8_t*>(&it->second.value), field->iFieldType));
+						return;
+					}
+				}
+
+				Game::Scr_AddFloat(ReadNumeric(address, field->iFieldType));
+			});
+
+		// WeapDefReset(<weapon>, [field])   no field = everything on that weapon
+		GSC::Script::AddFunction("WeapDefReset", []
+			{
+				const auto weapIndex = GetWeaponArg(0);
+				if (!weapIndex) return;
+				WeapDef_Reset(weapIndex, Game::Scr_GetNumParam() > 1 ? Game::Scr_GetString(1) : nullptr);
+			});
+
+		// Console: weapdef <weapon> <field> <value>   /   weapdef_reset <weapon> [field]
+		Command::Add("weapdef", [](const Command::Params* params)
+			{
+				if (params->size() < 4)
+				{
+					Logger::Print("usage: weapdef <weapon> <field> <value>   e.g. weapdef cheytac_mp reloadTime 4.534\n");
+					return;
+				}
+
+				const auto weapIndex = Game::G_GetWeaponIndexForName(params->get(1));
+				if (!weapIndex || !WeapDef_Set(weapIndex, params->get(2), params->get(3)))
+				{
+					Logger::Print("weapdef: could not set {} on {}\n", params->get(2), params->get(1));
+				}
+			});
+
+		Command::Add("weapdef_reset", [](const Command::Params* params)
+			{
+				if (params->size() < 2)
+				{
+					Logger::Print("usage: weapdef_reset <weapon> [field]\n");
+					return;
+				}
+
+				const auto weapIndex = Game::G_GetWeaponIndexForName(params->get(1));
+				if (weapIndex) WeapDef_Reset(weapIndex, params->size() > 2 ? params->get(2) : nullptr);
+			});
+	}
+
+	// =====================================================================
+	// Viewmodel anim clip player (layered)
+	// ---------------------------------------------------------------------
+	// Up to ANIM_CLIP_LAYERS clips at once. Each layer plays one viewmodel
+	// animation from <start>% to <end>% at <speed>x with a blend <weight>,
+	// optionally freezing on the end frame. Layers blend together, e.g.
+	// First Raise on layer 1 + Empty Reload on layer 2.
+	//
+	// animclip_keepads 1 (default): the two ADS anims (35/36) are left to
+	// the game, so aiming down sights still works while a clip plays.
+	// animclip_mixgame 1: the game's own anims (fire, reload...) are not
+	// silenced, so shooting during a clip still shows the fire anim
+	// blended with the clip. Default 0 = only the clip is visible.
+	// (Firing itself always works - it is server-side and never touched.)
+	//
+	// Purely client-side: only the view of the local player running this
+	// DLL changes - firing, timers and the server never see it.
 	//
 	// Engine addresses (iw4x.exe, found by disassembly):
 	//   0x4D15C0  DObjGetTree(DObj*) -> XAnimTree_s*
@@ -684,7 +1130,9 @@ namespace Components
 		// Highest time we seek to; 1.0 wraps to 0 on looping anims
 		constexpr float CLIP_MAX_TIME = 0.999f;
 
-		struct
+		constexpr int ANIM_CLIP_LAYERS = 4;
+
+		struct AnimClipLayer
 		{
 			bool active;
 			bool frozen;
@@ -693,18 +1141,53 @@ namespace Components
 			float start;
 			float end;
 			float speed;
+			float weight;
 			bool pendingStart[Game::NUM_WEAPON_HANDS];
 			float lastTime[Game::NUM_WEAPON_HANDS];
-		} animClip{};
+		};
+
+		AnimClipLayer animClipLayers[ANIM_CLIP_LAYERS]{};
+		const Game::dvar_t* animClipKeepAds = nullptr;
+		const Game::dvar_t* animClipMixGame = nullptr;
 
 		std::uint8_t* GetViewmodelHand(const int hand)
 		{
 			return reinterpret_cast<std::uint8_t*>(VIEWMODEL_HANDS + hand * VIEWMODEL_HAND_SIZE);
 		}
+
+		bool AnyClipActive()
+		{
+			for (const auto& layer : animClipLayers)
+			{
+				if (layer.active) return true;
+			}
+			return false;
+		}
+
+		bool IsAdsAnim(const unsigned int anim)
+		{
+			return anim == Game::WEAP_ANIM_ADS_UP || anim == Game::WEAP_ANIM_ADS_DOWN;
+		}
+
+		// Forget the last started anim so WeaponRunXModelAnims restarts
+		// whatever the player is doing (the game does the same to re-sync).
+		void ResyncViewmodel()
+		{
+			for (auto hand = 0; hand < Game::NUM_WEAPON_HANDS; ++hand)
+			{
+				*reinterpret_cast<int*>(GetViewmodelHand(hand) + VIEWMODEL_HAND_PREV_ANIM) = -1;
+			}
+		}
 	}
 
-	void Weapon::AnimClip_Play(const unsigned int anim, const float startPct, const float endPct, const float speed, const bool freezeAtEnd)
+	void Weapon::AnimClip_Play(const int layerIndex, const unsigned int anim, const float startPct, const float endPct, const float speed, const bool freezeAtEnd, const float weight)
 	{
+		if (layerIndex < 0 || layerIndex >= ANIM_CLIP_LAYERS)
+		{
+			Logger::Print("animclip: layer must be 1-{} (got {})\n", ANIM_CLIP_LAYERS, layerIndex + 1);
+			return;
+		}
+
 		if (anim < CLIP_FIRST_ANIM || anim > CLIP_LAST_ANIM)
 		{
 			Logger::Print("animclip: anim must be {}-{} (got {})\n", CLIP_FIRST_ANIM, CLIP_LAST_ANIM, anim);
@@ -715,92 +1198,118 @@ namespace Components
 		auto end = std::clamp(endPct, 0.0f, 100.0f) / 100.0f;
 		if (end <= start) end = 1.0f;
 
-		animClip.anim = anim;
-		animClip.start = std::min(start, CLIP_MAX_TIME);
-		animClip.end = std::min(end, CLIP_MAX_TIME);
-		animClip.speed = std::clamp(speed, 0.0f, 20.0f);
-		animClip.freezeAtEnd = freezeAtEnd;
-		animClip.frozen = false;
+		auto& layer = animClipLayers[layerIndex];
+		layer.anim = anim;
+		layer.start = std::min(start, CLIP_MAX_TIME);
+		layer.end = std::min(end, CLIP_MAX_TIME);
+		layer.speed = std::clamp(speed, 0.0f, 20.0f);
+		layer.weight = std::clamp(weight, 0.0f, 1.0f);
+		layer.freezeAtEnd = freezeAtEnd;
+		layer.frozen = false;
 
 		for (auto hand = 0; hand < Game::NUM_WEAPON_HANDS; ++hand)
 		{
-			animClip.pendingStart[hand] = true;
-			animClip.lastTime[hand] = animClip.start;
+			layer.pendingStart[hand] = true;
+			layer.lastTime[hand] = layer.start;
 		}
 
-		animClip.active = true;
+		layer.active = true;
 	}
 
-	void Weapon::AnimClip_Stop()
+	void Weapon::AnimClip_Stop(const int layerIndex)
 	{
-		if (!animClip.active) return;
+		const auto wasActive = AnyClipActive();
 
-		animClip.active = false;
-		animClip.frozen = false;
-
-		// Same thing the game does to force a re-sync: forget the last started
-		// anim so WeaponRunXModelAnims restarts whatever the player is doing.
-		for (auto hand = 0; hand < Game::NUM_WEAPON_HANDS; ++hand)
+		if (layerIndex < 0)
 		{
-			*reinterpret_cast<int*>(GetViewmodelHand(hand) + VIEWMODEL_HAND_PREV_ANIM) = -1;
+			for (auto& layer : animClipLayers)
+			{
+				layer.active = false;
+				layer.frozen = false;
+			}
+		}
+		else if (layerIndex < ANIM_CLIP_LAYERS)
+		{
+			animClipLayers[layerIndex].active = false;
+			animClipLayers[layerIndex].frozen = false;
+		}
+
+		// Last layer gone: hand the viewmodel back to the game
+		if (wasActive && !AnyClipActive())
+		{
+			ResyncViewmodel();
 		}
 	}
 
 	void Weapon::AnimClip_Frame([[maybe_unused]] Game::playerState_s* ps, const int hand)
 	{
-		if (!animClip.active || hand < 0 || hand >= Game::NUM_WEAPON_HANDS) return;
+		if (hand < 0 || hand >= Game::NUM_WEAPON_HANDS || !AnyClipActive()) return;
 
 		auto* obj = *reinterpret_cast<Game::DObj**>(GetViewmodelHand(hand));
 		if (!obj || !obj->tree) return;
 
 		auto* tree = DObjGetTree(obj);
-		const auto anim = animClip.anim;
-		const auto begin = animClip.pendingStart[hand];
-		const auto rate = animClip.frozen ? 0.0f : animClip.speed;
+		const auto keepAds = animClipKeepAds && animClipKeepAds->current.enabled;
+		const auto mixGame = animClipMixGame && animClipMixGame->current.enabled;
+
+		// Which anims belong to a playing layer this frame
+		bool used[CLIP_LAST_ANIM + 1]{};
+		for (const auto& layer : animClipLayers)
+		{
+			if (layer.active) used[layer.anim] = true;
+		}
 
 		// Runs right after the game's own anim update, so anything it just
-		// started this frame (fire, reload...) is overridden before drawing.
+		// started this frame (fire, reload...) is silenced before drawing.
 		for (auto i = CLIP_FIRST_ANIM; i <= CLIP_LAST_ANIM; ++i)
 		{
-			if (i == anim)
-			{
-				XAnimSetGoalWeight(obj, i, 1.0f, 0.0f, rate, 0, 0, begin ? 1 : 0);
-			}
-			else
-			{
-				XAnimSetGoalWeight(obj, i, 0.0f, 0.0f, 1.0f, 0, 0, 0);
-			}
+			if (used[i]) continue;
+			if (mixGame) break;
+			if (keepAds && IsAdsAnim(i)) continue;
+			XAnimSetGoalWeight(obj, i, 0.0f, 0.0f, 1.0f, 0, 0, 0);
 		}
 
-		if (begin)
+		for (auto layerIndex = 0; layerIndex < ANIM_CLIP_LAYERS; ++layerIndex)
 		{
-			XAnimSetTime(tree, anim, animClip.start);
-			animClip.pendingStart[hand] = false;
-			animClip.lastTime[hand] = animClip.start;
-			return;
-		}
+			auto& layer = animClipLayers[layerIndex];
+			if (!layer.active) continue;
 
-		if (animClip.frozen)
-		{
-			XAnimSetTime(tree, anim, animClip.end);
-			return;
-		}
+			const auto anim = layer.anim;
+			const auto begin = layer.pendingStart[hand];
+			const auto rate = layer.frozen ? 0.0f : layer.speed;
 
-		const auto time = XAnimGetTime(tree, anim);
-		const auto wrapped = (time + 0.5f) < animClip.lastTime[hand]; // looping anim passed 1.0
-		animClip.lastTime[hand] = time;
+			XAnimSetGoalWeight(obj, anim, layer.weight, 0.0f, rate, 0, 0, begin ? 1 : 0);
 
-		if (time >= animClip.end || wrapped)
-		{
-			if (animClip.freezeAtEnd)
+			if (begin)
 			{
-				animClip.frozen = true;
-				XAnimSetGoalWeight(obj, anim, 1.0f, 0.0f, 0.0f, 0, 0, 0);
-				XAnimSetTime(tree, anim, animClip.end);
+				XAnimSetTime(tree, anim, layer.start);
+				layer.pendingStart[hand] = false;
+				layer.lastTime[hand] = layer.start;
+				continue;
 			}
-			else
+
+			if (layer.frozen)
 			{
-				AnimClip_Stop();
+				XAnimSetTime(tree, anim, layer.end);
+				continue;
+			}
+
+			const auto time = XAnimGetTime(tree, anim);
+			const auto wrapped = (time + 0.5f) < layer.lastTime[hand]; // looping anim passed 1.0
+			layer.lastTime[hand] = time;
+
+			if (time >= layer.end || wrapped)
+			{
+				if (layer.freezeAtEnd)
+				{
+					layer.frozen = true;
+					XAnimSetGoalWeight(obj, anim, layer.weight, 0.0f, 0.0f, 0, 0, 0);
+					XAnimSetTime(tree, anim, layer.end);
+				}
+				else
+				{
+					AnimClip_Stop(layerIndex);
+				}
 			}
 		}
 	}
@@ -828,7 +1337,12 @@ namespace Components
 
 	void Weapon::AddAnimClip()
 	{
-		// animClipPlay(<anim>, [startPct = 0], [endPct = 100], [speed = 1.0], [freeze = 0])
+		animClipKeepAds = Game::Dvar_RegisterBool("animclip_keepads", true, Game::DVAR_ARCHIVE,
+			"Anim clips leave the ADS anims to the game, so you can aim down sights during a clip");
+		animClipMixGame = Game::Dvar_RegisterBool("animclip_mixgame", false, Game::DVAR_ARCHIVE,
+			"Anim clips blend with the game's own viewmodel anims (fire, reload...) instead of hiding them");
+
+		// AnimClipPlay(<anim>, [startPct = 0], [endPct = 100], [speed = 1.0], [freeze = 0], [layer = 1], [weight = 1.0])
 		GSC::Script::AddFunction("AnimClipPlay", []
 			{
 				const auto numParams = Game::Scr_GetNumParam();
@@ -837,27 +1351,37 @@ namespace Components
 				const auto end = numParams > 2 ? Game::Scr_GetFloat(2) : 100.0f;
 				const auto speed = numParams > 3 ? Game::Scr_GetFloat(3) : 1.0f;
 				const auto freeze = numParams > 4 ? Game::Scr_GetInt(4) != 0 : false;
-				AnimClip_Play(anim, start, end, speed, freeze);
+				const auto layer = numParams > 5 ? Game::Scr_GetInt(5) - 1 : 0;
+				const auto weight = numParams > 6 ? Game::Scr_GetFloat(6) : 1.0f;
+				AnimClip_Play(layer, anim, start, end, speed, freeze, weight);
 			});
 
-		// animClipStop();
+		// AnimClipStop([layer]);   no layer = stop all
 		GSC::Script::AddFunction("AnimClipStop", []
 			{
-				AnimClip_Stop();
+				AnimClip_Stop(Game::Scr_GetNumParam() > 0 ? Game::Scr_GetInt(0) - 1 : -1);
 			});
 
-		// playing = animClipIsPlaying();
+		// playing = AnimClipIsPlaying([layer]);   no layer = any
 		GSC::Script::AddFunction("AnimClipIsPlaying", []
 			{
-				Game::Scr_AddInt(animClip.active ? 1 : 0);
+				if (Game::Scr_GetNumParam() > 0)
+				{
+					const auto layer = Game::Scr_GetInt(0) - 1;
+					Game::Scr_AddInt(layer >= 0 && layer < ANIM_CLIP_LAYERS && animClipLayers[layer].active ? 1 : 0);
+				}
+				else
+				{
+					Game::Scr_AddInt(AnyClipActive() ? 1 : 0);
+				}
 			});
 
-		// Console: animclip <anim> [startPct] [endPct] [speed] [freeze]
+		// Console: animclip <anim> [startPct] [endPct] [speed] [freeze] [layer] [weight]
 		Command::Add("animclip", [](const Command::Params* params)
 			{
 				if (params->size() < 2)
 				{
-					Logger::Print("usage: animclip <anim 1-36> [startPct 0-100] [endPct 0-100] [speed] [freeze 0/1]\n");
+					Logger::Print("usage: animclip <anim 1-36> [startPct 0-100] [endPct 0-100] [speed] [freeze 0/1] [layer 1-{}] [weight 0-1]\n", ANIM_CLIP_LAYERS);
 					return;
 				}
 
@@ -866,15 +1390,18 @@ namespace Components
 				const auto end = params->size() > 3 ? std::strtof(params->get(3), nullptr) : 100.0f;
 				const auto speed = params->size() > 4 ? std::strtof(params->get(4), nullptr) : 1.0f;
 				const auto freeze = params->size() > 5 ? std::strtoul(params->get(5), nullptr, 10) != 0 : false;
-				AnimClip_Play(anim, start, end, speed, freeze);
+				const auto layer = params->size() > 6 ? std::atoi(params->get(6)) - 1 : 0;
+				const auto weight = params->size() > 7 ? std::strtof(params->get(7), nullptr) : 1.0f;
+				AnimClip_Play(layer, anim, start, end, speed, freeze, weight);
 			});
 
-		Command::Add("animclip_stop", []
+		// animclip_stop [layer]
+		Command::Add("animclip_stop", [](const Command::Params* params)
 			{
-				AnimClip_Stop();
+				AnimClip_Stop(params->size() > 1 ? std::atoi(params->get(1)) - 1 : -1);
 			});
 
-		// WeaponRunXModelAnims call in CG_UpdateViewModel... (per hand, per frame)
+		// WeaponRunXModelAnims call (per hand, per frame)
 		Utils::Hook(0x47F55C, WeaponRunXModelAnims_Stub, HOOK_CALL).install()->quick();
 	}
 
@@ -961,5 +1488,6 @@ namespace Components
 
 		AddScriptMethods();
 		AddAnimClip();
+		AddWeapDefEditing();
 	}
 }

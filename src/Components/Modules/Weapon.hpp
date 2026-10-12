@@ -42,9 +42,14 @@ namespace Components
 		static void PlayerCmd_FreezeControlsAllowLook(Game::scr_entref_t entref);
 
 		static void AddScriptMethods();
+		// Live weapon editing by weapon-file field name
+		static bool WeapDef_Set(unsigned int weapIndex, const char* fieldName, const char* value);
+		static void WeapDef_Reset(unsigned int weapIndex, const char* fieldName);
+		static void AddWeapDefEditing();
+
 		// Viewmodel anim clip player
-		static void AnimClip_Play(unsigned int anim, float startPct, float endPct, float speed, bool freezeAtEnd);
-		static void AnimClip_Stop();
+		static void AnimClip_Play(int layerIndex, unsigned int anim, float startPct, float endPct, float speed, bool freezeAtEnd, float weight);
+		static void AnimClip_Stop(int layerIndex = -1);
 		static void AnimClip_Frame(Game::playerState_s* ps, int hand);
 		static void WeaponRunXModelAnims_Stub();
 		static void AddAnimClip();
