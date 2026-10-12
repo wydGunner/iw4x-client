@@ -48,6 +48,14 @@ namespace Components
 		static void WeapDef_ResetAll();
 		static void AddWeapDefEditing();
 
+		// Per-player weapon overrides
+		static bool WeapDef_SetFor(int clientNum, unsigned int weapIndex, const char* fieldName, const char* value);
+		static void WeapDef_ResetFor(int clientNum, unsigned int weapIndex, const char* fieldName);
+		static void WeapDef_ClearFor(int clientNum);
+		static void WeaponRunXModelAnims_Hook(Game::playerState_s* ps, int hand);
+		static void CallWeaponRunXModelAnims(Game::playerState_s* ps, int hand);
+		static void AddPerPlayerWeapDef();
+
 		// Viewmodel anim clip player
 		static void AnimClip_Play(int layerIndex, unsigned int anim, float startPct, float endPct, float speed, bool freezeAtEnd, float weight);
 		static void AnimClip_Stop(int layerIndex = -1);

@@ -1396,17 +1396,9 @@ namespace Components
 		__asm
 		{
 			// entry: eax = hand, [esp] = return, [esp + 4] = playerState
-			push eax                    // save hand
+			push eax                    // hand
 			push dword ptr [esp + 8]    // playerState
-			mov eax, [esp + 4]          // hand
-			mov ecx, 0x59B5E0           // WeaponRunXModelAnims
-			call ecx
-			add esp, 4
-
-			pop eax                     // hand
-			push eax
-			push dword ptr [esp + 8]    // playerState
-			call AnimClip_Frame         // (playerState, hand)
+			call WeaponRunXModelAnims_Hook   // (playerState, hand)
 			add esp, 8
 			ret
 		}
@@ -1482,8 +1474,254 @@ namespace Components
 		Utils::Hook(0x47F55C, WeaponRunXModelAnims_Stub, HOOK_CALL).install()->quick();
 	}
 
+	// =====================================================================
+	// Per-player weapon overrides
+	// ---------------------------------------------------------------------
+	// WeapDefSet edits the weapon for EVERY player. These edit it for ONE
+	// player: the values are written into the gun right before that
+	// player's weapon update runs and restored right after, so each player
+	// sees their own reload / rechamber / raise / drop / sprint / fire times.
+	//
+	// Applied around:
+	//   PM_Weapon            (server ClientThink + the host's own prediction,
+	//                         both go through PmoveSingle -> our stub)
+	//   WeaponRunXModelAnims (host viewmodel anim rates, e.g. a slower reload
+	//                         anim for a slower reload time)
+	// Numeric fields only. Anim fields stay global (they are host-only
+	// visuals anyway). Other players' own clients keep stock values unless
+	// they run this DLL, same as before.
+	// =====================================================================
+	namespace
+	{
+		constexpr int OVERRIDE_CLIENTS = 64;
+
+		struct PlayerOverride
+		{
+			unsigned int weapIndex;
+			const Game::cspField_t* field;
+			float value;
+		};
+
+		struct AppliedValue
+		{
+			std::uint8_t* address;
+			std::uint32_t raw;
+			int size;
+		};
+
+		std::vector<PlayerOverride> playerOverrides[OVERRIDE_CLIENTS];
+
+		bool ValidClient(const int clientNum)
+		{
+			return clientNum >= 0 && clientNum < OVERRIDE_CLIENTS;
+		}
+
+		void ApplyPlayerOverrides(const int clientNum, std::vector<AppliedValue>& saved)
+		{
+			if (!ValidClient(clientNum) || playerOverrides[clientNum].empty()) return;
+
+			for (const auto& o : playerOverrides[clientNum])
+			{
+				auto* address = GetFieldAddress(o.weapIndex, o.field);
+				if (!address) continue;
+
+				const auto size = FieldSize(o.field);
+				saved.push_back(AppliedValue{ address, ReadRaw(address, size), size });
+				WriteNumeric(address, o.field->iFieldType, o.value);
+			}
+		}
+
+		void RestorePlayerOverrides(std::vector<AppliedValue>& saved)
+		{
+			// reverse order: two overrides on one shared address restore cleanly
+			for (auto it = saved.rbegin(); it != saved.rend(); ++it)
+			{
+				std::memcpy(it->address, &it->raw, it->size);
+			}
+			saved.clear();
+		}
+
+		PlayerOverride* FindOverride(const int clientNum, const unsigned int weapIndex, const Game::cspField_t* field)
+		{
+			for (auto& o : playerOverrides[clientNum])
+			{
+				if (o.weapIndex == weapIndex && o.field == field) return &o;
+			}
+			return nullptr;
+		}
+
+		int GetPlayerArg(const Game::scr_entref_t entref)
+		{
+			const auto* ent = GSC::Script::Scr_GetPlayerEntity(entref);
+			return ent ? ent->s.number : -1;
+		}
+	}
+
+	bool Weapon::WeapDef_SetFor(const int clientNum, const unsigned int weapIndex, const char* fieldName, const char* value)
+	{
+		const auto* field = FindWeaponField(fieldName);
+		if (!weapIndex || !field || !value) return false;
+
+		// anims are host-only visuals: keep using the global swap
+		if (IsAnimField(field)) return WeapDef_Set(weapIndex, fieldName, value);
+
+		if (!ValidClient(clientNum) || !IsNumericField(field)) return false;
+
+		const auto number = std::strtof(value, nullptr);
+		if (auto* existing = FindOverride(clientNum, weapIndex, field))
+		{
+			existing->value = number;
+		}
+		else
+		{
+			playerOverrides[clientNum].push_back(PlayerOverride{ weapIndex, field, number });
+		}
+		return true;
+	}
+
+	void Weapon::WeapDef_ResetFor(const int clientNum, const unsigned int weapIndex, const char* fieldName)
+	{
+		if (!ValidClient(clientNum)) return;
+
+		const auto* field = fieldName ? FindWeaponField(fieldName) : nullptr;
+		if (field && IsAnimField(field))
+		{
+			WeapDef_Reset(weapIndex, fieldName);
+			return;
+		}
+
+		auto& list = playerOverrides[clientNum];
+		std::erase_if(list, [&](const PlayerOverride& o)
+			{
+				if (o.weapIndex != weapIndex) return false;
+				return !field || o.field == field;
+			});
+
+		if (!fieldName)
+		{
+			// whole weapon: anim swaps too
+			for (auto anim = 0u; anim < static_cast<unsigned int>(Game::NUM_WEAP_ANIMS); ++anim)
+			{
+				SwapWeaponAnim(weapIndex, anim, nullptr);
+			}
+		}
+	}
+
+	void Weapon::WeapDef_ClearFor(const int clientNum)
+	{
+		if (ValidClient(clientNum)) playerOverrides[clientNum].clear();
+	}
+
+	void Weapon::WeaponRunXModelAnims_Hook(Game::playerState_s* ps, const int hand)
+	{
+		std::vector<AppliedValue> saved;
+		ApplyPlayerOverrides(ps ? ps->clientNum : -1, saved);
+		CallWeaponRunXModelAnims(ps, hand);
+		RestorePlayerOverrides(saved);
+
+		AnimClip_Frame(ps, hand);
+	}
+
+	__declspec(naked) void Weapon::CallWeaponRunXModelAnims([[maybe_unused]] Game::playerState_s* ps, [[maybe_unused]] int hand)
+	{
+		__asm
+		{
+			// cdecl (ps, hand) -> original: eax = hand, push ps
+			mov eax, [esp + 8]          // hand
+			push dword ptr [esp + 4]    // ps
+			mov ecx, 0x59B5E0           // WeaponRunXModelAnims
+			call ecx
+			add esp, 4
+			ret
+		}
+	}
+
+	void Weapon::AddPerPlayerWeapDef()
+	{
+		AssertOffset(Game::playerState_s, clientNum, 0x104);
+
+		Events::OnClientDisconnect([](const int clientNum)
+			{
+				WeapDef_ClearFor(clientNum);
+			});
+
+		// map change / fast_restart: weapon indices can change, scripts re-apply on spawn
+		Events::OnVMShutdown([]
+			{
+				for (auto& list : playerOverrides) list.clear();
+			});
+
+		// self WeapDefSetFor(<weapon>, <field>, <value>)   - only this player
+		GSC::Script::AddMethod("WeapDefSetFor", [](const Game::scr_entref_t entref)
+			{
+				const auto clientNum = GetPlayerArg(entref);
+				const auto weapIndex = GetWeaponArg(0);
+				const auto* field = GetFieldArg(1);
+				if (!weapIndex || !field) return;
+
+				if (IsAnimField(field))
+				{
+					WeapDef_SetFor(clientNum, weapIndex, field->szName, Game::Scr_GetString(2));
+				}
+				else
+				{
+					WeapDef_SetFor(clientNum, weapIndex, field->szName, std::to_string(Game::Scr_GetFloat(2)).c_str());
+				}
+			});
+
+		// value = self WeapDefGetFor(<weapon>, <field>)   - this player's value
+		GSC::Script::AddMethod("WeapDefGetFor", [](const Game::scr_entref_t entref)
+			{
+				const auto clientNum = GetPlayerArg(entref);
+				const auto weapIndex = GetWeaponArg(0);
+				const auto* field = GetFieldArg(1);
+				if (!weapIndex || !field)
+				{
+					Game::Scr_AddInt(0);
+					return;
+				}
+
+				if (IsAnimField(field))
+				{
+					Game::Scr_AddString(GetCurrentAnimName(weapIndex, AnimIndexOf(field)));
+					return;
+				}
+
+				if (ValidClient(clientNum))
+				{
+					if (const auto* o = FindOverride(clientNum, weapIndex, field))
+					{
+						Game::Scr_AddFloat(o->value);
+						return;
+					}
+				}
+
+				auto* address = GetFieldAddress(weapIndex, field);
+				Game::Scr_AddFloat(address ? ReadNumeric(address, field->iFieldType) : 0.0f);
+			});
+
+		// self WeapDefResetFor(<weapon>, [field])   - this player back to stock
+		GSC::Script::AddMethod("WeapDefResetFor", [](const Game::scr_entref_t entref)
+			{
+				const auto clientNum = GetPlayerArg(entref);
+				const auto weapIndex = GetWeaponArg(0);
+				if (!weapIndex) return;
+				WeapDef_ResetFor(clientNum, weapIndex, Game::Scr_GetNumParam() > 1 ? Game::Scr_GetString(1) : nullptr);
+			});
+
+		// self WeapDefClearFor()   - every per-player override of this player
+		GSC::Script::AddMethod("WeapDefClearFor", [](const Game::scr_entref_t entref)
+			{
+				WeapDef_ClearFor(GetPlayerArg(entref));
+			});
+	}
+
 	void Weapon::PM_Weapon_stub(Game::pmove_s* pm, Game::pml_t* pml)
 	{
+		// per-player weapon overrides for this player's update only
+		std::vector<AppliedValue> perPlayer;
+		ApplyPlayerOverrides((pm && pm->ps) ? pm->ps->clientNum : -1, perPlayer);
+
 		if (BGDisableDoubleTaps && BGDisableDoubleTaps->current.enabled)
 		{
 			if (pm && pm->ps)
@@ -1505,6 +1743,8 @@ namespace Components
 		}
 
 		Game::PM_Weapon(pm, pml);
+
+		RestorePlayerOverrides(perPlayer);
 	}
 
 	Weapon::Weapon()
@@ -1566,5 +1806,6 @@ namespace Components
 		AddScriptMethods();
 		AddAnimClip();
 		AddWeapDefEditing();
+		AddPerPlayerWeapDef();
 	}
 }
