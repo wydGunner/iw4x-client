@@ -673,7 +673,11 @@ namespace Components
 	//    (fireTime, firstRaiseTime, adsZoomFov) and anims are per variant.
 	//  - Edits live in this process: on a listen server they change both the
 	//    host's server and client. Other players' clients keep stock values.
-	//  - Everything resets on map load (weapons are reloaded from scratch).
+	//  - Stock (fastfile) weapons stay loaded for the whole game session, so
+	//    edits survive fast_restart and map changes. Every edit remembers
+	//    the original AND the value it wrote: if the field still holds what
+	//    we wrote, reset restores the original; if not, the game reloaded the
+	//    weapon and the current value is stock. Nothing is ever forgotten.
 	// =====================================================================
 	namespace
 	{
@@ -699,20 +703,24 @@ namespace Components
 		using XAnimCreate_t = void(*)(void* anims, unsigned int animIndex, const char* name);
 		const auto XAnimCreate = reinterpret_cast<XAnimCreate_t>(0x4EF790);
 
+		// One entry per edited field address (shared WeaponDefs share it)
 		struct SavedValue
 		{
-			std::uint32_t value;
+			std::uint32_t original;
+			std::uint32_t written;
 			int size;
 		};
 
+		// One entry per edited viewmodel anim entry (per weapon, per set)
 		struct SavedAnim
 		{
-			std::uint32_t entry[2];
+			std::uint32_t original[2];
+			std::uint32_t written[2];
+			std::string name;
 		};
 
-		std::unordered_map<std::uintptr_t, SavedValue> weapDefOriginals;   // field address -> original
-		std::unordered_map<std::uintptr_t, SavedAnim> weapAnimOriginals;   // anim entry address -> original
-		std::unordered_map<std::uint64_t, std::string> weapAnimNames;      // (weapon << 32 | anim) -> current name
+		std::unordered_map<std::uintptr_t, SavedValue> weapDefSaved;
+		std::unordered_map<std::uintptr_t, SavedAnim> weapAnimSaved;
 
 		const Game::cspField_t* FindWeaponField(const char* name)
 		{
@@ -737,6 +745,11 @@ namespace Components
 				&& field->iOffset < FULLDEF_XANIMS + static_cast<int>(Game::NUM_WEAP_ANIMS) * 4;
 		}
 
+		unsigned int AnimIndexOf(const Game::cspField_t* field)
+		{
+			return static_cast<unsigned int>((field->iOffset - FULLDEF_XANIMS) / 4);
+		}
+
 		bool IsNumericField(const Game::cspField_t* field)
 		{
 			switch (field->iFieldType)
@@ -749,6 +762,11 @@ namespace Components
 			default:
 				return false;
 			}
+		}
+
+		int FieldSize(const Game::cspField_t* field)
+		{
+			return field->iFieldType == CSPFT_BOOL ? 1 : 4;
 		}
 
 		// Map a full-def offset onto the live, separately allocated structs
@@ -770,15 +788,11 @@ namespace Components
 			return nullptr;
 		}
 
-		void SaveOriginal(std::uint8_t* address, const int size)
+		std::uint32_t ReadRaw(const std::uint8_t* address, const int size)
 		{
-			const auto key = reinterpret_cast<std::uintptr_t>(address);
-			if (weapDefOriginals.contains(key)) return;
-
-			SavedValue saved{};
-			saved.size = size;
-			std::memcpy(&saved.value, address, size);
-			weapDefOriginals.emplace(key, saved);
+			std::uint32_t value = 0;
+			std::memcpy(&value, address, size);
+			return value;
 		}
 
 		// Value in weapon-file units (seconds for ms fields)
@@ -804,10 +818,70 @@ namespace Components
 			}
 		}
 
+		// Is our edit at this address still in place? (if not, the game
+		// reloaded the weapon and whatever is there now is stock)
+		const SavedValue* LiveEdit(const std::uint8_t* address)
+		{
+			const auto it = weapDefSaved.find(reinterpret_cast<std::uintptr_t>(address));
+			if (it == weapDefSaved.end()) return nullptr;
+			if (ReadRaw(address, it->second.size) != it->second.written) return nullptr;
+			return &it->second;
+		}
+
+		void WriteField(std::uint8_t* address, const Game::cspField_t* field, const float value)
+		{
+			const auto size = FieldSize(field);
+			const auto key = reinterpret_cast<std::uintptr_t>(address);
+
+			// First edit, or the weapon was reloaded since: current value is stock
+			if (!LiveEdit(address))
+			{
+				const auto current = ReadRaw(address, size);
+				weapDefSaved[key] = SavedValue{ current, current, size };
+			}
+
+			WriteNumeric(address, field->iFieldType, value);
+			weapDefSaved[key].written = ReadRaw(address, size);
+		}
+
+		void RestoreField(std::uint8_t* address)
+		{
+			const auto key = reinterpret_cast<std::uintptr_t>(address);
+			if (const auto* saved = LiveEdit(address))
+			{
+				std::memcpy(address, &saved->original, saved->size);
+			}
+			weapDefSaved.erase(key);
+		}
+
 		std::uintptr_t* GetWeaponAnimSets(const unsigned int weapIndex)
 		{
 			const auto base = *reinterpret_cast<std::uintptr_t*>(CG_WEAPON_ANIMS_OPERAND);
 			return reinterpret_cast<std::uintptr_t*>(base + weapIndex * CG_WEAPON_ANIM_SETS * sizeof(std::uintptr_t));
+		}
+
+		std::uint32_t* GetAnimEntry(const std::uintptr_t anims, const unsigned int animIndex)
+		{
+			if (!anims || animIndex >= *reinterpret_cast<unsigned int*>(anims)) return nullptr;
+			return reinterpret_cast<std::uint32_t*>(anims + 4 + animIndex * 8);
+		}
+
+		const SavedAnim* LiveAnimEdit(const std::uint32_t* entry)
+		{
+			const auto it = weapAnimSaved.find(reinterpret_cast<std::uintptr_t>(entry));
+			if (it == weapAnimSaved.end()) return nullptr;
+			if (entry[0] != it->second.written[0] || entry[1] != it->second.written[1]) return nullptr;
+			return &it->second;
+		}
+
+		void RestoreAnimEntry(std::uint32_t* entry)
+		{
+			if (const auto* saved = LiveAnimEdit(entry))
+			{
+				entry[0] = saved->original[0];
+				entry[1] = saved->original[1];
+			}
+			weapAnimSaved.erase(reinterpret_cast<std::uintptr_t>(entry));
 		}
 
 		// name == nullptr: restore the original anim
@@ -820,46 +894,35 @@ namespace Components
 			}
 
 			auto* sets = GetWeaponAnimSets(weapIndex);
-			auto swapped = false;
+			auto found = false;
 
 			for (auto set = 0; set < CG_WEAPON_ANIM_SETS; ++set)
 			{
-				const auto anims = sets[set];
-				if (!anims) continue;
-				if (animIndex >= *reinterpret_cast<unsigned int*>(anims)) continue;
+				auto* entry = GetAnimEntry(sets[set], animIndex);
+				if (!entry) continue;
+				found = true;
 
-				auto* entry = reinterpret_cast<std::uint32_t*>(anims + 4 + animIndex * 8);
+				if (!name)
+				{
+					RestoreAnimEntry(entry);
+					continue;
+				}
+
 				const auto key = reinterpret_cast<std::uintptr_t>(entry);
-
-				if (!weapAnimOriginals.contains(key))
+				if (!LiveAnimEdit(entry))
 				{
-					weapAnimOriginals.emplace(key, SavedAnim{ { entry[0], entry[1] } });
+					weapAnimSaved[key] = SavedAnim{ { entry[0], entry[1] }, { entry[0], entry[1] }, {} };
 				}
 
-				if (name)
-				{
-					XAnimCreate(reinterpret_cast<void*>(anims), animIndex, name);
-				}
-				else
-				{
-					const auto& saved = weapAnimOriginals[key];
-					entry[0] = saved.entry[0];
-					entry[1] = saved.entry[1];
-				}
+				XAnimCreate(reinterpret_cast<void*>(sets[set]), animIndex, name);
 
-				swapped = true;
+				auto& saved = weapAnimSaved[key];
+				saved.written[0] = entry[0];
+				saved.written[1] = entry[1];
+				saved.name = name;
 			}
 
-			const auto nameKey = (static_cast<std::uint64_t>(weapIndex) << 32) | animIndex;
-			if (name) weapAnimNames[nameKey] = name;
-			else weapAnimNames.erase(nameKey);
-
-			if (!swapped)
-			{
-				Logger::Print("weapdef: weapon {} has no viewmodel anims registered yet\n", weapIndex);
-			}
-
-			return swapped;
+			return found || !name;
 		}
 
 		const char* GetOriginalAnimName(const unsigned int weapIndex, const unsigned int animIndex)
@@ -867,6 +930,16 @@ namespace Components
 			const auto* completeDef = Game::BG_GetWeaponCompleteDef(weapIndex);
 			if (!completeDef || !completeDef->szXAnims || !completeDef->szXAnims[animIndex]) return "";
 			return completeDef->szXAnims[animIndex];
+		}
+
+		const char* GetCurrentAnimName(const unsigned int weapIndex, const unsigned int animIndex)
+		{
+			auto* entry = GetAnimEntry(GetWeaponAnimSets(weapIndex)[0], animIndex);
+			if (entry)
+			{
+				if (const auto* saved = LiveAnimEdit(entry)) return saved->name.c_str();
+			}
+			return GetOriginalAnimName(weapIndex, animIndex);
 		}
 
 		unsigned int GetWeaponArg(const unsigned int index)
@@ -900,9 +973,8 @@ namespace Components
 
 		if (IsAnimField(field))
 		{
-			const auto animIndex = static_cast<unsigned int>((field->iOffset - FULLDEF_XANIMS) / 4);
 			const auto restore = !*value || !_stricmp(value, "default");
-			return SwapWeaponAnim(weapIndex, animIndex, restore ? nullptr : value);
+			return SwapWeaponAnim(weapIndex, AnimIndexOf(field), restore ? nullptr : value);
 		}
 
 		if (!IsNumericField(field)) return false;
@@ -910,75 +982,70 @@ namespace Components
 		auto* address = GetFieldAddress(weapIndex, field);
 		if (!address) return false;
 
-		SaveOriginal(address, field->iFieldType == CSPFT_BOOL ? 1 : 4);
-		WriteNumeric(address, field->iFieldType, std::strtof(value, nullptr));
+		WriteField(address, field, std::strtof(value, nullptr));
 		return true;
 	}
 
 	void Weapon::WeapDef_Reset(const unsigned int weapIndex, const char* fieldName)
 	{
-		const auto* field = fieldName ? FindWeaponField(fieldName) : nullptr;
-
-		if (field)
+		if (fieldName)
 		{
+			const auto* field = FindWeaponField(fieldName);
+			if (!field) return;
+
 			if (IsAnimField(field))
 			{
-				const auto animIndex = static_cast<unsigned int>((field->iOffset - FULLDEF_XANIMS) / 4);
-				if (weapAnimNames.contains((static_cast<std::uint64_t>(weapIndex) << 32) | animIndex))
-				{
-					SwapWeaponAnim(weapIndex, animIndex, nullptr);
-				}
-				return;
+				SwapWeaponAnim(weapIndex, AnimIndexOf(field), nullptr);
 			}
-
-			auto* address = GetFieldAddress(weapIndex, field);
-			if (!address) return;
-
-			const auto it = weapDefOriginals.find(reinterpret_cast<std::uintptr_t>(address));
-			if (it == weapDefOriginals.end()) return;
-
-			std::memcpy(address, &it->second.value, it->second.size);
+			else if (IsNumericField(field))
+			{
+				if (auto* address = GetFieldAddress(weapIndex, field)) RestoreField(address);
+			}
 			return;
 		}
 
-		// Whole weapon: every numeric field + every swapped anim
+		// Whole weapon: every numeric field + every anim
 		const auto* fields = reinterpret_cast<const Game::cspField_t*>(WEAPON_FIELD_TABLE);
 		for (auto i = 0; i < WEAPON_FIELD_COUNT; ++i)
 		{
 			if (!IsNumericField(&fields[i])) continue;
-			auto* address = GetFieldAddress(weapIndex, &fields[i]);
-			if (!address) continue;
-
-			const auto it = weapDefOriginals.find(reinterpret_cast<std::uintptr_t>(address));
-			if (it != weapDefOriginals.end())
-			{
-				std::memcpy(address, &it->second.value, it->second.size);
-			}
+			if (auto* address = GetFieldAddress(weapIndex, &fields[i])) RestoreField(address);
 		}
 
 		for (auto anim = 0u; anim < static_cast<unsigned int>(Game::NUM_WEAP_ANIMS); ++anim)
 		{
-			if (weapAnimNames.contains((static_cast<std::uint64_t>(weapIndex) << 32) | anim))
+			SwapWeaponAnim(weapIndex, anim, nullptr);
+		}
+	}
+
+	void Weapon::WeapDef_ResetAll()
+	{
+		for (auto& [key, saved] : weapDefSaved)
+		{
+			auto* address = reinterpret_cast<std::uint8_t*>(key);
+			if (ReadRaw(address, saved.size) == saved.written)
 			{
-				SwapWeaponAnim(weapIndex, anim, nullptr);
+				std::memcpy(address, &saved.original, saved.size);
 			}
 		}
+		weapDefSaved.clear();
+
+		for (auto& [key, saved] : weapAnimSaved)
+		{
+			auto* entry = reinterpret_cast<std::uint32_t*>(key);
+			if (entry[0] == saved.written[0] && entry[1] == saved.written[1])
+			{
+				entry[0] = saved.original[0];
+				entry[1] = saved.original[1];
+			}
+		}
+		weapAnimSaved.clear();
 	}
 
 	void Weapon::AddWeapDefEditing()
 	{
 		AssertSize(Game::WeaponCompleteDef, FULLDEF_WEAPDEF);
 		AssertSize(Game::WeaponDef, FULLDEF_WEAPDEF_END - FULLDEF_WEAPDEF);
-
-		// New map = weapons reloaded = old addresses meaningless
-		const auto clearSaved = []
-		{
-			weapDefOriginals.clear();
-			weapAnimOriginals.clear();
-			weapAnimNames.clear();
-		};
-		Events::OnSVInit(clearSaved);
-		Events::OnCGameInit(clearSaved);
 
 		// WeapDefSet(<weapon>, <field>, <value>)
 		//   numeric fields: number, seconds for *Time fields
@@ -1013,9 +1080,8 @@ namespace Components
 
 				if (IsAnimField(field))
 				{
-					const auto animIndex = static_cast<unsigned int>((field->iOffset - FULLDEF_XANIMS) / 4);
-					const auto it = weapAnimNames.find((static_cast<std::uint64_t>(weapIndex) << 32) | animIndex);
-					Game::Scr_AddString(!original && it != weapAnimNames.end() ? it->second.c_str() : GetOriginalAnimName(weapIndex, animIndex));
+					const auto animIndex = AnimIndexOf(field);
+					Game::Scr_AddString(original ? GetOriginalAnimName(weapIndex, animIndex) : GetCurrentAnimName(weapIndex, animIndex));
 					return;
 				}
 
@@ -1028,10 +1094,9 @@ namespace Components
 
 				if (original)
 				{
-					const auto it = weapDefOriginals.find(reinterpret_cast<std::uintptr_t>(address));
-					if (it != weapDefOriginals.end())
+					if (const auto* saved = LiveEdit(address))
 					{
-						Game::Scr_AddFloat(ReadNumeric(reinterpret_cast<const std::uint8_t*>(&it->second.value), field->iFieldType));
+						Game::Scr_AddFloat(ReadNumeric(reinterpret_cast<const std::uint8_t*>(&saved->original), field->iFieldType));
 						return;
 					}
 				}
@@ -1047,7 +1112,13 @@ namespace Components
 				WeapDef_Reset(weapIndex, Game::Scr_GetNumParam() > 1 ? Game::Scr_GetString(1) : nullptr);
 			});
 
-		// Console: weapdef <weapon> <field> <value>   /   weapdef_reset <weapon> [field]
+		// WeapDefResetAll()   every edited weapon back to stock
+		GSC::Script::AddFunction("WeapDefResetAll", []
+			{
+				WeapDef_ResetAll();
+			});
+
+		// Console: weapdef <weapon> <field> <value>   /   weapdef_reset <weapon> [field]   /   weapdef_resetall
 		Command::Add("weapdef", [](const Command::Params* params)
 			{
 				if (params->size() < 4)
@@ -1073,6 +1144,12 @@ namespace Components
 
 				const auto weapIndex = Game::G_GetWeaponIndexForName(params->get(1));
 				if (weapIndex) WeapDef_Reset(weapIndex, params->size() > 2 ? params->get(2) : nullptr);
+			});
+
+		Command::Add("weapdef_resetall", []
+			{
+				WeapDef_ResetAll();
+				Logger::Print("weapdef: every edited weapon reset to stock\n");
 			});
 	}
 

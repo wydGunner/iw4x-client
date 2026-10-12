@@ -45,6 +45,7 @@ namespace Components
 		// Live weapon editing by weapon-file field name
 		static bool WeapDef_Set(unsigned int weapIndex, const char* fieldName, const char* value);
 		static void WeapDef_Reset(unsigned int weapIndex, const char* fieldName);
+		static void WeapDef_ResetAll();
 		static void AddWeapDefEditing();
 
 		// Viewmodel anim clip player
