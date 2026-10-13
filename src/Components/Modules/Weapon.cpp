@@ -1555,6 +1555,16 @@ namespace Components
 			const auto* ent = GSC::Script::Scr_GetPlayerEntity(entref);
 			return ent ? ent->s.number : -1;
 		}
+
+		// Per-player "no rechamber" guns (weapon indices), see NoRechamber_*
+		std::vector<unsigned int> noRechamberWeapons[OVERRIDE_CLIENTS];
+
+		bool HasNoRechamber(const int clientNum, const unsigned int weapIndex)
+		{
+			if (!ValidClient(clientNum) || !weapIndex) return false;
+			const auto& list = noRechamberWeapons[clientNum];
+			return std::find(list.begin(), list.end(), weapIndex) != list.end();
+		}
 	}
 
 	bool Weapon::WeapDef_SetFor(const int clientNum, const unsigned int weapIndex, const char* fieldName, const char* value)
@@ -1643,12 +1653,14 @@ namespace Components
 		Events::OnClientDisconnect([](const int clientNum)
 			{
 				WeapDef_ClearFor(clientNum);
+				if (ValidClient(clientNum)) noRechamberWeapons[clientNum].clear();
 			});
 
 		// map change / fast_restart: weapon indices can change, scripts re-apply on spawn
 		Events::OnVMShutdown([]
 			{
 				for (auto& list : playerOverrides) list.clear();
+				for (auto& list : noRechamberWeapons) list.clear();
 			});
 
 		// self WeapDefSetFor(<weapon>, <field>, <value>)   - only this player
@@ -1742,9 +1754,117 @@ namespace Components
 			}
 		}
 
+		NoRechamber_BeforeWeapon(pm);
+
 		Game::PM_Weapon(pm, pml);
 
 		RestorePlayerOverrides(perPlayer);
+
+		NoRechamber_AfterWeapon(pm ? pm->ps : nullptr);
+	}
+
+	// =====================================================================
+	// Per-player "no rechamber" (OMEN No Cock)
+	// ---------------------------------------------------------------------
+	// Doesn't touch the weapon's timings. It changes only THIS player's own
+	// weapon state, which the server already sends to their game, so a stock
+	// IW4x game follows it without needing anything installed.
+	//
+	//  - One shot still plays the normal bolt (nothing changes on its own).
+	//  - Fire, sprint or switch weapons while the bolt is still cycling:
+	//    the gun is marked ready right there (state READY, timer 0), so the
+	//    shot goes out / you come out of the sprint ready / the swap starts.
+	//  - A gun that is NOT in your hands never owes a cock-back: its
+	//    "needs rechamber" flag is cleared, so pulling it back out is clean.
+	//
+	// The held gun's flag is left alone while its bolt cycles normally (the
+	// game may use it to play that bolt) and cleared together with the
+	// READY above.
+	//
+	// GSC:  self SetNoRechamber(<weapon>, <on 0/1>)   self ClearNoRechamber()
+	// =====================================================================
+	void Weapon::NoRechamber_BeforeWeapon(Game::pmove_s* pm)
+	{
+		if (!pm || !pm->ps) return;
+		auto* ps = pm->ps;
+		const auto clientNum = ps->clientNum;
+		if (!ValidClient(clientNum) || noRechamberWeapons[clientNum].empty()) return;
+
+		const auto weapon = ps->weapCommon.weapon;
+		if (!HasNoRechamber(clientNum, weapon)) return;
+
+		const auto wantsFire = (pm->cmd.buttons & Game::CMD_BUTTON_ATTACK) != 0;
+		const auto wantsSprint = (pm->cmd.buttons & Game::CMD_BUTTON_SPRINT) != 0;
+		const auto cmdWeapon = static_cast<unsigned int>(pm->cmd.weapon);
+		const auto wantsSwitch = cmdWeapon != 0 && cmdWeapon != weapon;
+		if (!wantsFire && !wantsSprint && !wantsSwitch) return;
+
+		auto cleared = false;
+		for (auto& ws : ps->weapState)
+		{
+			if (ws.weaponState == Game::WEAPON_RECHAMBERING)
+			{
+				ws.weaponState = Game::WEAPON_READY;
+				ws.weaponTime = 0;
+				cleared = true;
+			}
+		}
+
+		if (!cleared) return;
+
+		for (auto i = 0; i < static_cast<int>(std::size(ps->weaponsEquipped)); ++i)
+		{
+			if (ps->weaponsEquipped[i] == weapon)
+			{
+				ps->weapEquippedData[i].needsRechamber[0] = false;
+				ps->weapEquippedData[i].needsRechamber[1] = false;
+			}
+		}
+	}
+
+	void Weapon::NoRechamber_AfterWeapon(Game::playerState_s* ps)
+	{
+		if (!ps) return;
+		const auto clientNum = ps->clientNum;
+		if (!ValidClient(clientNum) || noRechamberWeapons[clientNum].empty()) return;
+
+		const auto held = ps->weapCommon.weapon;
+		for (auto i = 0; i < static_cast<int>(std::size(ps->weaponsEquipped)); ++i)
+		{
+			const auto weapIndex = ps->weaponsEquipped[i];
+			if (!weapIndex || weapIndex == held) continue;
+			if (!HasNoRechamber(clientNum, weapIndex)) continue;
+
+			ps->weapEquippedData[i].needsRechamber[0] = false;
+			ps->weapEquippedData[i].needsRechamber[1] = false;
+		}
+	}
+
+	void Weapon::AddNoRechamber()
+	{
+		// self SetNoRechamber(<weapon>, <on 0/1>)   - only this player, only that gun
+		GSC::Script::AddMethod("SetNoRechamber", [](const Game::scr_entref_t entref)
+			{
+				const auto clientNum = GetPlayerArg(entref);
+				if (!ValidClient(clientNum)) return;
+
+				const auto weapIndex = GetWeaponArg(0);
+				if (!weapIndex) return;
+
+				const auto on = Game::Scr_GetNumParam() < 2 || Game::Scr_GetInt(1) != 0;
+				auto& list = noRechamberWeapons[clientNum];
+				const auto it = std::find(list.begin(), list.end(), weapIndex);
+
+				if (on && it == list.end()) list.push_back(weapIndex);
+				else if (!on && it != list.end()) list.erase(it);
+			});
+
+		// self ClearNoRechamber()   - every gun of this player back to normal
+		GSC::Script::AddMethod("ClearNoRechamber", [](const Game::scr_entref_t entref)
+			{
+				const auto clientNum = GetPlayerArg(entref);
+				if (ValidClient(clientNum)) noRechamberWeapons[clientNum].clear();
+			});
 	}
 
 	Weapon::Weapon()
@@ -1807,5 +1927,6 @@ namespace Components
 		AddAnimClip();
 		AddWeapDefEditing();
 		AddPerPlayerWeapDef();
+		AddNoRechamber();
 	}
 }

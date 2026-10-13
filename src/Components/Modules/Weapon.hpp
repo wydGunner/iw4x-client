@@ -56,6 +56,13 @@ namespace Components
 		static void CallWeaponRunXModelAnims(Game::playerState_s* ps, int hand);
 		static void AddPerPlayerWeapDef();
 
+		// Per-player "no rechamber" (OMEN No Cock): the bolt never holds this
+		// player back on the listed guns - changes their weapon state only,
+		// never the shared weapon definition
+		static void NoRechamber_BeforeWeapon(Game::pmove_s* pm);
+		static void NoRechamber_AfterWeapon(Game::playerState_s* ps);
+		static void AddNoRechamber();
+
 		// Viewmodel anim clip player
 		static void AnimClip_Play(int layerIndex, unsigned int anim, float startPct, float endPct, float speed, bool freezeAtEnd, float weight);
 		static void AnimClip_Stop(int layerIndex = -1);
