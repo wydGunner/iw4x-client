@@ -70,6 +70,13 @@ namespace Components
 		static void FakeLunge_AfterWeapon(Game::playerState_s* ps);
 		static void AddFakeLunge();
 
+		// Per-player "server-only Sleight of Hand" (OMEN Slow Reload): the
+		// player's game sees no SoH (Marathon reload animation) while the
+		// server runs their weapon logic WITH it (SoH timing for everything)
+		static bool ServerSoh_Begin(Game::playerState_s* ps);
+		static void ServerSoh_End(Game::playerState_s* ps, bool applied);
+		static void AddServerSoh();
+
 		// Viewmodel anim clip player
 		static void AnimClip_Play(int layerIndex, unsigned int anim, float startPct, float endPct, float speed, bool freezeAtEnd, float weight);
 		static void AnimClip_Stop(int layerIndex = -1);

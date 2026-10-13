@@ -1559,6 +1559,9 @@ namespace Components
 		// Per-player "no rechamber" guns (weapon indices), see NoRechamber_*
 		std::vector<unsigned int> noRechamberWeapons[OVERRIDE_CLIENTS];
 
+		// Per-player "server-only Sleight of Hand", see ServerSoh_*
+		bool serverSoh[OVERRIDE_CLIENTS]{};
+
 		// Per-player fake-lunge guns (weapon indices), see FakeLunge_*
 		std::vector<unsigned int> fakeLungeWeapons[OVERRIDE_CLIENTS];
 		bool fakeLungeActive[OVERRIDE_CLIENTS]{};   // a lunge we started is running
@@ -1637,7 +1640,9 @@ namespace Components
 	{
 		std::vector<AppliedValue> saved;
 		ApplyPlayerOverrides(ps ? ps->clientNum : -1, saved);
+		const auto sohApplied = ServerSoh_Begin(ps);
 		CallWeaponRunXModelAnims(ps, hand);
+		ServerSoh_End(ps, sohApplied);
 		RestorePlayerOverrides(saved);
 
 		AnimClip_Frame(ps, hand);
@@ -1669,6 +1674,7 @@ namespace Components
 					noRechamberWeapons[clientNum].clear();
 					fakeLungeWeapons[clientNum].clear();
 					fakeLungeActive[clientNum] = false;
+					serverSoh[clientNum] = false;
 				}
 			});
 
@@ -1679,6 +1685,7 @@ namespace Components
 				for (auto& list : noRechamberWeapons) list.clear();
 				for (auto& list : fakeLungeWeapons) list.clear();
 				for (auto& active : fakeLungeActive) active = false;
+				for (auto& soh : serverSoh) soh = false;
 			});
 
 		// self WeapDefSetFor(<weapon>, <field>, <value>)   - only this player
@@ -1774,9 +1781,11 @@ namespace Components
 
 		NoRechamber_BeforeWeapon(pm);
 		FakeLunge_BeforeWeapon(pm);
+		const auto sohApplied = ServerSoh_Begin(pm ? pm->ps : nullptr);
 
 		Game::PM_Weapon(pm, pml);
 
+		ServerSoh_End(pm ? pm->ps : nullptr, sohApplied);
 		RestorePlayerOverrides(perPlayer);
 
 		NoRechamber_AfterWeapon(pm ? pm->ps : nullptr);
@@ -1842,6 +1851,49 @@ namespace Components
 		// no pull toward the (made-up) target
 		ps->meleeChargeDist = 0;
 		ps->meleeChargeTime = 0;
+	}
+
+	// =====================================================================
+	// Per-player "server-only Sleight of Hand" (OMEN Slow Reload)
+	// ---------------------------------------------------------------------
+	// OMEN takes Sleight of Hand away from the player (the perk bit their game
+	// receives is off, so it plays the full Marathon reload animation). With
+	// this on, the server puts the SoH bit back ONLY while it runs that
+	// player's weapon update, and clears it again right after - so reload,
+	// ammo-in, swapping during a reload and anything else the engine ties to
+	// SoH behave exactly like a real SoH class (SoH NAC cfgs line up), while
+	// the state sent to the player's game still says no SoH.
+	//
+	// GSC:  self SetServerSoh(<on 0/1>)
+	// =====================================================================
+	bool Weapon::ServerSoh_Begin(Game::playerState_s* ps)
+	{
+		if (!ps) return false;
+		const auto clientNum = ps->clientNum;
+		if (!ValidClient(clientNum) || !serverSoh[clientNum]) return false;
+
+		constexpr auto bit = 1u << Game::PERK_FASTRELOAD;
+		if (ps->perks[0] & bit) return false;   // already has it for real
+
+		ps->perks[0] |= bit;
+		return true;
+	}
+
+	void Weapon::ServerSoh_End(Game::playerState_s* ps, const bool applied)
+	{
+		if (!ps || !applied) return;
+		ps->perks[0] &= ~(1u << Game::PERK_FASTRELOAD);
+	}
+
+	void Weapon::AddServerSoh()
+	{
+		// self SetServerSoh(<on 0/1>)   - only this player
+		GSC::Script::AddMethod("SetServerSoh", [](const Game::scr_entref_t entref)
+			{
+				const auto clientNum = GetPlayerArg(entref);
+				if (!ValidClient(clientNum)) return;
+				serverSoh[clientNum] = Game::Scr_GetNumParam() < 1 || Game::Scr_GetInt(0) != 0;
+			});
 	}
 
 	void Weapon::AddFakeLunge()
@@ -2039,5 +2091,6 @@ namespace Components
 		AddPerPlayerWeapDef();
 		AddNoRechamber();
 		AddFakeLunge();
+		AddServerSoh();
 	}
 }
