@@ -63,6 +63,13 @@ namespace Components
 		static void NoRechamber_AfterWeapon(Game::playerState_s* ps);
 		static void AddNoRechamber();
 
+		// Per-player fake lunge (OMEN test option): pressing melee with a
+		// listed gun does the game's real melee-charge (lunge) instead of a
+		// plain melee - without the pull toward a target
+		static void FakeLunge_BeforeWeapon(Game::pmove_s* pm);
+		static void FakeLunge_AfterWeapon(Game::playerState_s* ps);
+		static void AddFakeLunge();
+
 		// Viewmodel anim clip player
 		static void AnimClip_Play(int layerIndex, unsigned int anim, float startPct, float endPct, float speed, bool freezeAtEnd, float weight);
 		static void AnimClip_Stop(int layerIndex = -1);

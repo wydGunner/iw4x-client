@@ -1559,6 +1559,17 @@ namespace Components
 		// Per-player "no rechamber" guns (weapon indices), see NoRechamber_*
 		std::vector<unsigned int> noRechamberWeapons[OVERRIDE_CLIENTS];
 
+		// Per-player fake-lunge guns (weapon indices), see FakeLunge_*
+		std::vector<unsigned int> fakeLungeWeapons[OVERRIDE_CLIENTS];
+		bool fakeLungeActive[OVERRIDE_CLIENTS]{};   // a lunge we started is running
+
+		bool HasFakeLunge(const int clientNum, const unsigned int weapIndex)
+		{
+			if (!ValidClient(clientNum) || !weapIndex) return false;
+			const auto& list = fakeLungeWeapons[clientNum];
+			return std::find(list.begin(), list.end(), weapIndex) != list.end();
+		}
+
 		bool HasNoRechamber(const int clientNum, const unsigned int weapIndex)
 		{
 			if (!ValidClient(clientNum) || !weapIndex) return false;
@@ -1653,7 +1664,12 @@ namespace Components
 		Events::OnClientDisconnect([](const int clientNum)
 			{
 				WeapDef_ClearFor(clientNum);
-				if (ValidClient(clientNum)) noRechamberWeapons[clientNum].clear();
+				if (ValidClient(clientNum))
+				{
+					noRechamberWeapons[clientNum].clear();
+					fakeLungeWeapons[clientNum].clear();
+					fakeLungeActive[clientNum] = false;
+				}
 			});
 
 		// map change / fast_restart: weapon indices can change, scripts re-apply on spawn
@@ -1661,6 +1677,8 @@ namespace Components
 			{
 				for (auto& list : playerOverrides) list.clear();
 				for (auto& list : noRechamberWeapons) list.clear();
+				for (auto& list : fakeLungeWeapons) list.clear();
+				for (auto& active : fakeLungeActive) active = false;
 			});
 
 		// self WeapDefSetFor(<weapon>, <field>, <value>)   - only this player
@@ -1755,12 +1773,104 @@ namespace Components
 		}
 
 		NoRechamber_BeforeWeapon(pm);
+		FakeLunge_BeforeWeapon(pm);
 
 		Game::PM_Weapon(pm, pml);
 
 		RestorePlayerOverrides(perPlayer);
 
 		NoRechamber_AfterWeapon(pm ? pm->ps : nullptr);
+		FakeLunge_AfterWeapon(pm ? pm->ps : nullptr);
+	}
+
+	// =====================================================================
+	// Per-player fake lunge (OMEN test option)
+	// ---------------------------------------------------------------------
+	// A real lunge is decided by the player's own game: when an enemy is in
+	// range it puts a lunge distance + direction into the input it sends
+	// (usercmd meleeChargeDist / meleeChargeYaw) and the weapon code turns
+	// the melee into a melee-charge. Here, on the SERVER, a melee press with
+	// a listed gun gets a 1-unit lunge toward where the player is looking
+	// filled in, so the game runs its own melee-charge: lunge anim, then the
+	// gun comes back by itself. Only this player, nothing installed needed.
+	//
+	// No pull: while that lunge runs, the player's charge distance/timer are
+	// zeroed after the weapon update, so the movement code has nothing to
+	// pull them along. (It's still a real melee - it can hit what's right in
+	// front of you.)
+	//
+	// GSC:  self SetFakeLunge(<weapon>, <on 0/1>)   self ClearFakeLunge()
+	// =====================================================================
+	void Weapon::FakeLunge_BeforeWeapon(Game::pmove_s* pm)
+	{
+		if (!pm || !pm->ps) return;
+		auto* ps = pm->ps;
+		const auto clientNum = ps->clientNum;
+		if (!ValidClient(clientNum) || fakeLungeWeapons[clientNum].empty()) return;
+		if (!HasFakeLunge(clientNum, ps->weapCommon.weapon)) return;
+
+		// only on the press, not while it's held
+		const auto pressed = (pm->cmd.buttons & Game::CMD_BUTTON_MELEE) != 0;
+		const auto wasPressed = (pm->oldcmd.buttons & Game::CMD_BUTTON_MELEE) != 0;
+		if (!pressed || wasPressed) return;
+
+		// the player's own game already found a real target: leave it alone
+		if (pm->cmd.meleeChargeDist != 0) return;
+
+		pm->cmd.meleeChargeDist = 1;
+		pm->cmd.meleeChargeYaw = ps->viewangles[1];
+		fakeLungeActive[clientNum] = true;
+	}
+
+	void Weapon::FakeLunge_AfterWeapon(Game::playerState_s* ps)
+	{
+		if (!ps) return;
+		const auto clientNum = ps->clientNum;
+		if (!ValidClient(clientNum) || !fakeLungeActive[clientNum]) return;
+
+		const auto state = ps->weapState[Game::WEAPON_HAND_RIGHT].weaponState;
+		const auto meleeRunning = state == Game::WEAPON_MELEE_INIT
+			|| state == Game::WEAPON_MELEE_FIRE
+			|| state == Game::WEAPON_MELEE_END;
+
+		if (!meleeRunning)
+		{
+			fakeLungeActive[clientNum] = false;
+			return;
+		}
+
+		// no pull toward the (made-up) target
+		ps->meleeChargeDist = 0;
+		ps->meleeChargeTime = 0;
+	}
+
+	void Weapon::AddFakeLunge()
+	{
+		// self SetFakeLunge(<weapon>, <on 0/1>)   - only this player, only that gun
+		GSC::Script::AddMethod("SetFakeLunge", [](const Game::scr_entref_t entref)
+			{
+				const auto clientNum = GetPlayerArg(entref);
+				if (!ValidClient(clientNum)) return;
+
+				const auto weapIndex = GetWeaponArg(0);
+				if (!weapIndex) return;
+
+				const auto on = Game::Scr_GetNumParam() < 2 || Game::Scr_GetInt(1) != 0;
+				auto& list = fakeLungeWeapons[clientNum];
+				const auto it = std::find(list.begin(), list.end(), weapIndex);
+
+				if (on && it == list.end()) list.push_back(weapIndex);
+				else if (!on && it != list.end()) list.erase(it);
+			});
+
+		// self ClearFakeLunge()   - every gun of this player back to normal melee
+		GSC::Script::AddMethod("ClearFakeLunge", [](const Game::scr_entref_t entref)
+			{
+				const auto clientNum = GetPlayerArg(entref);
+				if (!ValidClient(clientNum)) return;
+				fakeLungeWeapons[clientNum].clear();
+				fakeLungeActive[clientNum] = false;
+			});
 	}
 
 	// =====================================================================
@@ -1928,5 +2038,6 @@ namespace Components
 		AddWeapDefEditing();
 		AddPerPlayerWeapDef();
 		AddNoRechamber();
+		AddFakeLunge();
 	}
 }
