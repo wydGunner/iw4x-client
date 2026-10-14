@@ -1566,18 +1566,68 @@ namespace Components
 		std::vector<unsigned int> fakeLungeWeapons[OVERRIDE_CLIENTS];
 		bool fakeLungeActive[OVERRIDE_CLIENTS]{};   // a lunge we started is running
 
+		// ---- This game's OWN copy (players running this dll) -------------
+		// The server sends these with console commands (omen_norechamber,
+		// omen_fakelunge, omen_soh) so the player's own game predicts its
+		// weapon exactly like the server runs it - no corrections, no glitch.
+		// Only used while this game is a client of someone else's server and
+		// only for the local player's own prediction.
+		std::vector<unsigned int> localNoRechamber;
+		std::vector<unsigned int> localFakeLunge;
+		bool localSoh = false;
+
+		void ClearLocalMods()
+		{
+			localNoRechamber.clear();
+			localFakeLunge.clear();
+			localSoh = false;
+		}
+
+		bool LocalPredict(const int clientNum)
+		{
+			if (Game::SV_Loaded()) return false;            // we're the server: GSC drives the tables
+			if (!Game::CL_IsCgameInitialized()) return false;
+			return Game::cgArray[0].clientNum == clientNum;
+		}
+
+		bool InList(const std::vector<unsigned int>& list, const unsigned int weapIndex)
+		{
+			return weapIndex && std::find(list.begin(), list.end(), weapIndex) != list.end();
+		}
+
+		bool AnyFakeLunge(const int clientNum)
+		{
+			if (!ValidClient(clientNum)) return false;
+			if (!fakeLungeWeapons[clientNum].empty()) return true;
+			return !localFakeLunge.empty() && LocalPredict(clientNum);
+		}
+
+		bool AnyNoRechamber(const int clientNum)
+		{
+			if (!ValidClient(clientNum)) return false;
+			if (!noRechamberWeapons[clientNum].empty()) return true;
+			return !localNoRechamber.empty() && LocalPredict(clientNum);
+		}
+
 		bool HasFakeLunge(const int clientNum, const unsigned int weapIndex)
 		{
 			if (!ValidClient(clientNum) || !weapIndex) return false;
-			const auto& list = fakeLungeWeapons[clientNum];
-			return std::find(list.begin(), list.end(), weapIndex) != list.end();
+			if (InList(fakeLungeWeapons[clientNum], weapIndex)) return true;
+			return InList(localFakeLunge, weapIndex) && LocalPredict(clientNum);
 		}
 
 		bool HasNoRechamber(const int clientNum, const unsigned int weapIndex)
 		{
 			if (!ValidClient(clientNum) || !weapIndex) return false;
-			const auto& list = noRechamberWeapons[clientNum];
-			return std::find(list.begin(), list.end(), weapIndex) != list.end();
+			if (InList(noRechamberWeapons[clientNum], weapIndex)) return true;
+			return InList(localNoRechamber, weapIndex) && LocalPredict(clientNum);
+		}
+
+		void SetInList(std::vector<unsigned int>& list, const unsigned int weapIndex, const bool on)
+		{
+			const auto it = std::find(list.begin(), list.end(), weapIndex);
+			if (on && it == list.end()) list.push_back(weapIndex);
+			else if (!on && it != list.end()) list.erase(it);
 		}
 	}
 
@@ -1640,7 +1690,7 @@ namespace Components
 	{
 		std::vector<AppliedValue> saved;
 		ApplyPlayerOverrides(ps ? ps->clientNum : -1, saved);
-		const auto sohApplied = ServerSoh_Begin(ps);
+		const auto sohApplied = ServerSoh_Begin(ps, false);   // viewmodel keeps the Marathon-speed anim
 		CallWeaponRunXModelAnims(ps, hand);
 		ServerSoh_End(ps, sohApplied);
 		RestorePlayerOverrides(saved);
@@ -1781,7 +1831,7 @@ namespace Components
 
 		NoRechamber_BeforeWeapon(pm);
 		FakeLunge_BeforeWeapon(pm);
-		const auto sohApplied = ServerSoh_Begin(pm ? pm->ps : nullptr);
+		const auto sohApplied = ServerSoh_Begin(pm ? pm->ps : nullptr, true);
 
 		Game::PM_Weapon(pm, pml);
 
@@ -1816,7 +1866,7 @@ namespace Components
 		if (!pm || !pm->ps) return;
 		auto* ps = pm->ps;
 		const auto clientNum = ps->clientNum;
-		if (!ValidClient(clientNum) || fakeLungeWeapons[clientNum].empty()) return;
+		if (!AnyFakeLunge(clientNum)) return;
 		if (!HasFakeLunge(clientNum, ps->weapCommon.weapon)) return;
 
 		// only on the press, not while it's held
@@ -1829,6 +1879,9 @@ namespace Components
 
 		pm->cmd.meleeChargeDist = 1;
 		pm->cmd.meleeChargeYaw = ps->viewangles[1];
+
+		// own-game prediction replays inputs every frame - log on the server only
+		if (LocalPredict(clientNum)) return;
 		fakeLungeActive[clientNum] = true;
 
 		Logger::Print("fakelunge: client {} melee press - lunge requested (weapon state {}, anim {})\n",
@@ -1869,11 +1922,13 @@ namespace Components
 	//
 	// GSC:  self SetServerSoh(<on 0/1>)
 	// =====================================================================
-	bool Weapon::ServerSoh_Begin(Game::playerState_s* ps)
+	bool Weapon::ServerSoh_Begin(Game::playerState_s* ps, const bool allowLocal)
 	{
 		if (!ps) return false;
 		const auto clientNum = ps->clientNum;
-		if (!ValidClient(clientNum) || !serverSoh[clientNum]) return false;
+		if (!ValidClient(clientNum)) return false;
+		const auto wanted = serverSoh[clientNum] || (allowLocal && localSoh && LocalPredict(clientNum));
+		if (!wanted) return false;
 
 		constexpr auto bit = 1u << Game::PERK_FASTRELOAD;
 		if (ps->perks[0] & bit) return false;   // already has it for real
@@ -1886,6 +1941,44 @@ namespace Components
 	{
 		if (!ps || !applied) return;
 		ps->perks[0] &= ~(1u << Game::PERK_FASTRELOAD);
+	}
+
+	void Weapon::AddLocalModCommands()
+	{
+		// The player's own game: same per-player mods the server runs for
+		// them, so its prediction matches (OMEN sends these to dll players).
+		//   omen_norechamber <weapon> <0/1>     omen_fakelunge <weapon> <0/1>
+		//   omen_soh <0/1>                      omen_localmods_clear
+		Command::Add("omen_norechamber", [](const Command::Params* params)
+			{
+				if (params->size() < 2) return;
+				const auto weapIndex = Game::G_GetWeaponIndexForName(params->get(1));
+				if (!weapIndex) return;
+				SetInList(localNoRechamber, weapIndex, params->size() < 3 || std::atoi(params->get(2)) != 0);
+			});
+
+		Command::Add("omen_fakelunge", [](const Command::Params* params)
+			{
+				if (params->size() < 2) return;
+				const auto weapIndex = Game::G_GetWeaponIndexForName(params->get(1));
+				if (!weapIndex) return;
+				SetInList(localFakeLunge, weapIndex, params->size() < 3 || std::atoi(params->get(2)) != 0);
+			});
+
+		Command::Add("omen_soh", [](const Command::Params* params)
+			{
+				localSoh = params->size() < 2 || std::atoi(params->get(1)) != 0;
+			});
+
+		Command::Add("omen_localmods_clear", []
+			{
+				ClearLocalMods();
+			});
+
+		// leaving a server / loading a map: weapon indices can change,
+		// the server sends everything again on spawn
+		Events::OnCLDisconnected([](bool) { ClearLocalMods(); });
+		Events::OnCGameInit([] { ClearLocalMods(); });
 	}
 
 	void Weapon::AddServerSoh()
@@ -1953,7 +2046,7 @@ namespace Components
 		if (!pm || !pm->ps) return;
 		auto* ps = pm->ps;
 		const auto clientNum = ps->clientNum;
-		if (!ValidClient(clientNum) || noRechamberWeapons[clientNum].empty()) return;
+		if (!AnyNoRechamber(clientNum)) return;
 
 		const auto weapon = ps->weapCommon.weapon;
 		if (!HasNoRechamber(clientNum, weapon)) return;
@@ -1991,7 +2084,7 @@ namespace Components
 	{
 		if (!ps) return;
 		const auto clientNum = ps->clientNum;
-		if (!ValidClient(clientNum) || noRechamberWeapons[clientNum].empty()) return;
+		if (!AnyNoRechamber(clientNum)) return;
 
 		const auto held = ps->weapCommon.weapon;
 		for (auto i = 0; i < static_cast<int>(std::size(ps->weaponsEquipped)); ++i)
@@ -2095,5 +2188,6 @@ namespace Components
 		AddNoRechamber();
 		AddFakeLunge();
 		AddServerSoh();
+		AddLocalModCommands();
 	}
 }
