@@ -1568,19 +1568,21 @@ namespace Components
 
 		// ---- This game's OWN copy (players running this dll) -------------
 		// The server sends these with console commands (omen_norechamber,
-		// omen_fakelunge, omen_soh) so the player's own game predicts its
+		// omen_fakelunge, omen_slow / omen_sohclass) so the player's own game predicts its
 		// weapon exactly like the server runs it - no corrections, no glitch.
 		// Only used while this game is a client of someone else's server and
 		// only for the local player's own prediction.
 		std::vector<unsigned int> localNoRechamber;
 		std::vector<unsigned int> localFakeLunge;
-		bool localSoh = false;
+		std::vector<unsigned int> localSlow;    // Slow Reload guns
+		bool localSohClass = false;             // this life's class has Sleight of Hand
 
 		void ClearLocalMods()
 		{
 			localNoRechamber.clear();
 			localFakeLunge.clear();
-			localSoh = false;
+			localSlow.clear();
+			localSohClass = false;
 		}
 
 		bool LocalPredict(const int clientNum)
@@ -1927,7 +1929,10 @@ namespace Components
 		if (!ps) return false;
 		const auto clientNum = ps->clientNum;
 		if (!ValidClient(clientNum)) return false;
-		const auto wanted = serverSoh[clientNum] || (allowLocal && localSoh && LocalPredict(clientNum));
+		// own game: same rule the server's OMEN script uses - SoH class,
+		// holding a Slow Reload gun
+		const auto wanted = serverSoh[clientNum]
+			|| (allowLocal && localSohClass && InList(localSlow, ps->weapCommon.weapon) && LocalPredict(clientNum));
 		if (!wanted) return false;
 
 		constexpr auto bit = 1u << Game::PERK_FASTRELOAD;
@@ -1948,7 +1953,8 @@ namespace Components
 		// The player's own game: same per-player mods the server runs for
 		// them, so its prediction matches (OMEN sends these to dll players).
 		//   omen_norechamber <weapon> <0/1>     omen_fakelunge <weapon> <0/1>
-		//   omen_soh <0/1>                      omen_localmods_clear
+		//   omen_slow <weapon> <0/1>            omen_sohclass <0/1>
+		//   omen_localmods_clear
 		Command::Add("omen_norechamber", [](const Command::Params* params)
 			{
 				if (params->size() < 2) return;
@@ -1965,9 +1971,17 @@ namespace Components
 				SetInList(localFakeLunge, weapIndex, params->size() < 3 || std::atoi(params->get(2)) != 0);
 			});
 
-		Command::Add("omen_soh", [](const Command::Params* params)
+		Command::Add("omen_slow", [](const Command::Params* params)
 			{
-				localSoh = params->size() < 2 || std::atoi(params->get(1)) != 0;
+				if (params->size() < 2) return;
+				const auto weapIndex = Game::G_GetWeaponIndexForName(params->get(1));
+				if (!weapIndex) return;
+				SetInList(localSlow, weapIndex, params->size() < 3 || std::atoi(params->get(2)) != 0);
+			});
+
+		Command::Add("omen_sohclass", [](const Command::Params* params)
+			{
+				localSohClass = params->size() < 2 || std::atoi(params->get(1)) != 0;
 			});
 
 		Command::Add("omen_localmods_clear", []
