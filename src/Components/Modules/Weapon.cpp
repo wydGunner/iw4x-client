@@ -1803,10 +1803,11 @@ namespace Components
 	// filled in, so the game runs its own melee-charge: lunge anim, then the
 	// gun comes back by itself. Only this player, nothing installed needed.
 	//
-	// No pull: while that lunge runs, the player's charge distance/timer are
-	// zeroed after the weapon update, so the movement code has nothing to
-	// pull them along. (It's still a real melee - it can hit what's right in
-	// front of you.)
+	// No pull: the made-up target is 1 unit away, so the lunge movement is
+	// 1 unit - not visible. (Zeroing the distance after the weapon update
+	// turned it back into a plain melee.) It's still a real melee - it can
+	// hit what's right in front of you. Each lunge is logged to the console
+	// (fakelunge: ...) while this is being tested.
 	//
 	// GSC:  self SetFakeLunge(<weapon>, <on 0/1>)   self ClearFakeLunge()
 	// =====================================================================
@@ -1829,6 +1830,9 @@ namespace Components
 		pm->cmd.meleeChargeDist = 1;
 		pm->cmd.meleeChargeYaw = ps->viewangles[1];
 		fakeLungeActive[clientNum] = true;
+
+		Logger::Print("fakelunge: client {} melee press - lunge requested (weapon state {}, anim {})\n",
+			clientNum, ps->weapState[Game::WEAPON_HAND_RIGHT].weaponState, ps->weapState[Game::WEAPON_HAND_RIGHT].weapAnim);
 	}
 
 	void Weapon::FakeLunge_AfterWeapon(Game::playerState_s* ps)
@@ -1838,19 +1842,18 @@ namespace Components
 		if (!ValidClient(clientNum) || !fakeLungeActive[clientNum]) return;
 
 		const auto state = ps->weapState[Game::WEAPON_HAND_RIGHT].weaponState;
-		const auto meleeRunning = state == Game::WEAPON_MELEE_INIT
-			|| state == Game::WEAPON_MELEE_FIRE
-			|| state == Game::WEAPON_MELEE_END;
 
-		if (!meleeRunning)
+		// what the game made of it - logged once per lunge (first frame after the press)
+		if (fakeLungeActive[clientNum])
 		{
-			fakeLungeActive[clientNum] = false;
-			return;
+			Logger::Print("fakelunge: client {} after weapon update - state {}, anim {} (melee charge anim = {}), chargeDist {}, chargeTime {}\n",
+				clientNum, state, ps->weapState[Game::WEAPON_HAND_RIGHT].weapAnim, static_cast<int>(Game::WEAP_ANIM_MELEE_CHARGE),
+				ps->meleeChargeDist, ps->meleeChargeTime);
 		}
 
-		// no pull toward the (made-up) target
-		ps->meleeChargeDist = 0;
-		ps->meleeChargeTime = 0;
+		// The 1-unit lunge is left alone (zeroing it here turned it back into
+		// a plain melee) - a 1-unit pull isn't visible.
+		fakeLungeActive[clientNum] = false;
 	}
 
 	// =====================================================================
