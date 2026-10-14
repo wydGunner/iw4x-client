@@ -2143,6 +2143,14 @@ namespace Components
 
 	void Weapon::AddLocalModCommands()
 	{
+		// omen_hello: the OMEN server asks "do you have the OMEN dll?".
+		// We answer with a client command it can catch. A stock game doesn't
+		// know omen_hello and passes it to the server instead - also an answer.
+		Command::Add("omen_hello", []([[maybe_unused]] const Command::Params* params)
+			{
+				Game::CL_AddReliableCommand(0, "omen_dll_yes 2");
+			});
+
 		// The player's own game: same per-player mods the server runs for
 		// them, so its prediction matches (OMEN sends these to dll players).
 		//   omen_norechamber <weapon> <0/1>     omen_fakelunge <weapon> <0/1>
