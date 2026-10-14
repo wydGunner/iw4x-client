@@ -1209,6 +1209,28 @@ namespace Components
 
 		constexpr int ANIM_CLIP_LAYERS = 4;
 
+		// Playback modes (animclip arg 8)
+		enum ClipMode
+		{
+			CLIP_FORWARD = 0,
+			CLIP_REVERSE = 1,
+			CLIP_PINGPONG = 2,       // start -> end -> start, once
+			CLIP_LOOP = 3,           // start -> end, repeat until stopped
+			CLIP_PINGPONG_LOOP = 4,  // bounce until stopped
+			CLIP_MODE_COUNT
+		};
+
+		// Curves over the clip's progress (0..1). Speed curves average 1x so
+		// the clip takes about as long as it does flat.
+		enum ClipCurve
+		{
+			CURVE_FLAT = 0,
+			CURVE_IN = 1,       // speed: slow -> fast   weight: fade in
+			CURVE_OUT = 2,      // speed: fast -> slow   weight: fade out
+			CURVE_IN_OUT = 3,   // speed: slow ends      weight: up then down
+			CURVE_COUNT
+		};
+
 		struct AnimClipLayer
 		{
 			bool active;
@@ -1219,8 +1241,24 @@ namespace Components
 			float end;
 			float speed;
 			float weight;
-			bool pendingStart[Game::NUM_WEAPON_HANDS];
-			float lastTime[Game::NUM_WEAPON_HANDS];
+			int mode;
+			int speedCurve;
+			int weightCurve;
+			int holdMs;      // freeze: how long to hold the end pose (0 = until stopped)
+			int blendMs;     // fade in at the start, fade out when it ends
+
+			// runtime (driven from the right hand, copied to the left)
+			bool pendingStart;
+			float pos;        // anim time we put it at
+			float lastSet;    // what we set last frame (engine advances from it)
+			int dir;          // +1 / -1
+			bool bounced;     // ping-pong: on the way back
+			int startedAt;
+			int frozenAt;
+			bool fading;
+			int fadeAt;
+			float outWeight;  // weight / rate / time used this frame
+			float outRate;
 		};
 
 		AnimClipLayer animClipLayers[ANIM_CLIP_LAYERS]{};
@@ -1257,7 +1295,8 @@ namespace Components
 		}
 	}
 
-	void Weapon::AnimClip_Play(const int layerIndex, const unsigned int anim, const float startPct, const float endPct, const float speed, const bool freezeAtEnd, const float weight)
+	void Weapon::AnimClip_Play(const int layerIndex, const unsigned int anim, const float startPct, const float endPct, const float speed, const bool freezeAtEnd, const float weight,
+		const int mode, const int speedCurve, const int weightCurve, const int holdMs, const int blendMs)
 	{
 		if (layerIndex < 0 || layerIndex >= ANIM_CLIP_LAYERS)
 		{
@@ -1282,14 +1321,22 @@ namespace Components
 		layer.speed = std::clamp(speed, 0.0f, 20.0f);
 		layer.weight = std::clamp(weight, 0.0f, 1.0f);
 		layer.freezeAtEnd = freezeAtEnd;
+		layer.mode = (mode >= 0 && mode < CLIP_MODE_COUNT) ? mode : CLIP_FORWARD;
+		layer.speedCurve = (speedCurve >= 0 && speedCurve < CURVE_COUNT) ? speedCurve : CURVE_FLAT;
+		layer.weightCurve = (weightCurve >= 0 && weightCurve < CURVE_COUNT) ? weightCurve : CURVE_FLAT;
+		layer.holdMs = std::clamp(holdMs, 0, 60000);
+		layer.blendMs = std::clamp(blendMs, 0, 10000);
+
 		layer.frozen = false;
-
-		for (auto hand = 0; hand < Game::NUM_WEAPON_HANDS; ++hand)
-		{
-			layer.pendingStart[hand] = true;
-			layer.lastTime[hand] = layer.start;
-		}
-
+		layer.fading = false;
+		layer.bounced = false;
+		layer.dir = (layer.mode == CLIP_REVERSE) ? -1 : 1;
+		layer.pos = (layer.mode == CLIP_REVERSE) ? layer.end : layer.start;
+		layer.lastSet = layer.pos;
+		layer.outWeight = 0.0f;
+		layer.outRate = 0.0f;
+		layer.pendingStart = true;
+		layer.startedAt = Game::Sys_Milliseconds();
 		layer.active = true;
 	}
 
@@ -1318,6 +1365,51 @@ namespace Components
 		}
 	}
 
+	namespace
+	{
+		// speed multiplier at progress u (each averages 1.0 over 0..1)
+		float ClipSpeedCurve(const int curve, const float u)
+		{
+			switch (curve)
+			{
+			case CURVE_IN: return 0.2f + 1.6f * u;
+			case CURVE_OUT: return 1.8f - 1.6f * u;
+			case CURVE_IN_OUT: return 0.2f + 1.6f * (1.0f - std::fabs(2.0f * u - 1.0f));
+			default: return 1.0f;
+			}
+		}
+
+		// weight multiplier at progress u
+		float ClipWeightCurve(const int curve, const float u)
+		{
+			switch (curve)
+			{
+			case CURVE_IN: return u;
+			case CURVE_OUT: return 1.0f - u;
+			case CURVE_IN_OUT: return std::sin(u * 3.14159265f);
+			default: return 1.0f;
+			}
+		}
+
+		// 0..1 through the whole clip (ping-pong counts there and back)
+		float ClipProgress(const AnimClipLayer& layer)
+		{
+			const auto span = std::max(layer.end - layer.start, 0.0001f);
+			const auto f = std::clamp((layer.pos - layer.start) / span, 0.0f, 1.0f);
+			switch (layer.mode)
+			{
+			case CLIP_REVERSE: return 1.0f - f;
+			case CLIP_PINGPONG:
+			case CLIP_PINGPONG_LOOP: return layer.bounced ? 0.5f + 0.5f * (1.0f - f) : 0.5f * f;
+			default: return f;
+			}
+		}
+	}
+
+	// The clip runs on its own clock: the engine plays the anim at the
+	// layer's rate, we read how far it moved since last frame, then put it
+	// where WE want it (forwards, backwards, bounced...). So reverse and
+	// ping-pong need no anim lengths - the engine measures the step for us.
 	void Weapon::AnimClip_Frame([[maybe_unused]] Game::playerState_s* ps, const int hand)
 	{
 		if (hand < 0 || hand >= Game::NUM_WEAPON_HANDS || !AnyClipActive()) return;
@@ -1328,8 +1420,8 @@ namespace Components
 		auto* tree = DObjGetTree(obj);
 		const auto keepAds = animClipKeepAds && animClipKeepAds->current.enabled;
 		const auto mixGame = animClipMixGame && animClipMixGame->current.enabled;
+		const auto now = Game::Sys_Milliseconds();
 
-		// Which anims belong to a playing layer this frame
 		bool used[CLIP_LAST_ANIM + 1]{};
 		for (const auto& layer : animClipLayers)
 		{
@@ -1350,44 +1442,133 @@ namespace Components
 		{
 			auto& layer = animClipLayers[layerIndex];
 			if (!layer.active) continue;
-
 			const auto anim = layer.anim;
-			const auto begin = layer.pendingStart[hand];
-			const auto rate = layer.frozen ? 0.0f : layer.speed;
 
-			XAnimSetGoalWeight(obj, anim, layer.weight, 0.0f, rate, 0, 0, begin ? 1 : 0);
-
-			if (begin)
+			// Left hand (akimbo) just copies what the right hand worked out
+			if (hand != 0)
 			{
-				XAnimSetTime(tree, anim, layer.start);
-				layer.pendingStart[hand] = false;
-				layer.lastTime[hand] = layer.start;
+				XAnimSetGoalWeight(obj, anim, layer.outWeight, 0.0f, layer.outRate, 0, 0, 0);
+				XAnimSetTime(tree, anim, std::clamp(layer.pos, 0.0f, CLIP_MAX_TIME));
 				continue;
 			}
 
-			if (layer.frozen)
+			auto restart = 0;
+			if (layer.pendingStart)
 			{
-				XAnimSetTime(tree, anim, layer.end);
-				continue;
+				layer.pendingStart = false;
+				restart = 1;
 			}
-
-			const auto time = XAnimGetTime(tree, anim);
-			const auto wrapped = (time + 0.5f) < layer.lastTime[hand]; // looping anim passed 1.0
-			layer.lastTime[hand] = time;
-
-			if (time >= layer.end || wrapped)
+			else if (!layer.frozen && !layer.fading)
 			{
-				if (layer.freezeAtEnd)
+				// how far the engine moved it since we last set it
+				auto step = XAnimGetTime(tree, anim) - layer.lastSet;
+				if (step < -0.5f) step += 1.0f;   // looping anim wrapped past 1.0
+				step = std::clamp(step, 0.0f, 0.1f);
+
+				layer.pos += static_cast<float>(layer.dir) * step;
+
+				auto finished = false;
+				if (layer.dir > 0 && layer.pos >= layer.end)
 				{
-					layer.frozen = true;
-					XAnimSetGoalWeight(obj, anim, layer.weight, 0.0f, 0.0f, 0, 0, 0);
-					XAnimSetTime(tree, anim, layer.end);
+					switch (layer.mode)
+					{
+					case CLIP_LOOP:
+						layer.pos = layer.start;
+						break;
+					case CLIP_PINGPONG:
+					case CLIP_PINGPONG_LOOP:
+						layer.pos = layer.end;
+						layer.dir = -1;
+						layer.bounced = true;
+						break;
+					default:
+						layer.pos = layer.end;
+						finished = true;
+						break;
+					}
+				}
+				else if (layer.dir < 0 && layer.pos <= layer.start)
+				{
+					if (layer.mode == CLIP_PINGPONG_LOOP)
+					{
+						layer.pos = layer.start;
+						layer.dir = 1;
+						layer.bounced = false;
+					}
+					else
+					{
+						layer.pos = layer.start;
+						finished = true;
+					}
+				}
+
+				if (finished)
+				{
+					if (layer.freezeAtEnd)
+					{
+						layer.frozen = true;
+						layer.frozenAt = now;
+					}
+					else if (layer.blendMs > 0)
+					{
+						layer.fading = true;
+						layer.fadeAt = now;
+					}
+					else
+					{
+						AnimClip_Stop(layerIndex);
+						continue;
+					}
+				}
+			}
+
+			// Hold: freeze for holdMs, then fade out (or just let go)
+			if (layer.frozen && layer.holdMs > 0 && !layer.fading && now - layer.frozenAt >= layer.holdMs)
+			{
+				if (layer.blendMs > 0)
+				{
+					layer.fading = true;
+					layer.fadeAt = now;
 				}
 				else
 				{
 					AnimClip_Stop(layerIndex);
+					continue;
 				}
 			}
+
+			const auto progress = ClipProgress(layer);
+			auto w = layer.weight * ClipWeightCurve(layer.weightCurve, progress);
+
+			if (layer.blendMs > 0)
+			{
+				const auto sinceStart = static_cast<float>(now - layer.startedAt);
+				if (sinceStart < layer.blendMs)
+					w *= sinceStart / static_cast<float>(layer.blendMs);
+
+				if (layer.fading)
+				{
+					const auto out = 1.0f - static_cast<float>(now - layer.fadeAt) / static_cast<float>(layer.blendMs);
+					if (out <= 0.0f)
+					{
+						AnimClip_Stop(layerIndex);
+						continue;
+					}
+					w *= out;
+				}
+			}
+
+			// tiny floor so a faded-to-zero layer still keeps its slot in the tree
+			w = std::clamp(w, 0.001f, 1.0f);
+			const auto rate = (layer.frozen || layer.fading) ? 0.0f : layer.speed * ClipSpeedCurve(layer.speedCurve, progress);
+
+			layer.outWeight = w;
+			layer.outRate = rate;
+
+			XAnimSetGoalWeight(obj, anim, w, 0.0f, rate, 0, 0, restart);
+			const auto t = std::clamp(layer.pos, 0.0f, CLIP_MAX_TIME);
+			XAnimSetTime(tree, anim, t);
+			layer.lastSet = t;
 		}
 	}
 
@@ -1422,7 +1603,12 @@ namespace Components
 				const auto freeze = numParams > 4 ? Game::Scr_GetInt(4) != 0 : false;
 				const auto layer = numParams > 5 ? Game::Scr_GetInt(5) - 1 : 0;
 				const auto weight = numParams > 6 ? Game::Scr_GetFloat(6) : 1.0f;
-				AnimClip_Play(layer, anim, start, end, speed, freeze, weight);
+				const auto mode = numParams > 7 ? Game::Scr_GetInt(7) : 0;
+				const auto speedCurve = numParams > 8 ? Game::Scr_GetInt(8) : 0;
+				const auto weightCurve = numParams > 9 ? Game::Scr_GetInt(9) : 0;
+				const auto holdMs = numParams > 10 ? Game::Scr_GetInt(10) : 0;
+				const auto blendMs = numParams > 11 ? Game::Scr_GetInt(11) : 0;
+				AnimClip_Play(layer, anim, start, end, speed, freeze, weight, mode, speedCurve, weightCurve, holdMs, blendMs);
 			});
 
 		// AnimClipStop([layer]);   no layer = stop all
@@ -1445,12 +1631,14 @@ namespace Components
 				}
 			});
 
-		// Console: animclip <anim> [startPct] [endPct] [speed] [freeze] [layer] [weight]
+		// Console: animclip <anim> [startPct] [endPct] [speed] [freeze] [layer] [weight] [mode] [speedcurve] [weightcurve] [holdMs] [blendMs]
+		//   mode: 0 forward, 1 reverse, 2 ping-pong, 3 loop, 4 ping-pong loop
+		//   curves: 0 flat, 1 in, 2 out, 3 in-out
 		Command::Add("animclip", [](const Command::Params* params)
 			{
 				if (params->size() < 2)
 				{
-					Logger::Print("usage: animclip <anim 1-36> [startPct 0-100] [endPct 0-100] [speed] [freeze 0/1] [layer 1-{}] [weight 0-1]\n", ANIM_CLIP_LAYERS);
+					Logger::Print("usage: animclip <anim 1-36> [startPct 0-100] [endPct 0-100] [speed] [freeze 0/1] [layer 1-{}] [weight 0-1] [mode 0-4] [speedcurve 0-3] [weightcurve 0-3] [holdMs] [blendMs]\n", ANIM_CLIP_LAYERS);
 					return;
 				}
 
@@ -1461,7 +1649,12 @@ namespace Components
 				const auto freeze = params->size() > 5 ? std::strtoul(params->get(5), nullptr, 10) != 0 : false;
 				const auto layer = params->size() > 6 ? std::atoi(params->get(6)) - 1 : 0;
 				const auto weight = params->size() > 7 ? std::strtof(params->get(7), nullptr) : 1.0f;
-				AnimClip_Play(layer, anim, start, end, speed, freeze, weight);
+				const auto mode = params->size() > 8 ? std::atoi(params->get(8)) : 0;
+				const auto speedCurve = params->size() > 9 ? std::atoi(params->get(9)) : 0;
+				const auto weightCurve = params->size() > 10 ? std::atoi(params->get(10)) : 0;
+				const auto holdMs = params->size() > 11 ? std::atoi(params->get(11)) : 0;
+				const auto blendMs = params->size() > 12 ? std::atoi(params->get(12)) : 0;
+				AnimClip_Play(layer, anim, start, end, speed, freeze, weight, mode, speedCurve, weightCurve, holdMs, blendMs);
 			});
 
 		// animclip_stop [layer]
