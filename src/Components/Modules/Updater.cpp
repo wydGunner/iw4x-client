@@ -42,7 +42,19 @@ namespace Components
       }
 
       const std::string tag = doc["tag_name"].GetString();
-      if (REVISION_STR != tag)
+
+      // OMEN build: only call it outdated when official IW4x is actually
+      // newer than the revision this build is based on. The plain "!=" made
+      // every OMEN build (always a few commits past the release tag) show
+      // "update available", and updating through the launcher replaces the
+      // OMEN iw4x.dll with the official one.
+      auto tagRevision = 0;
+      if (tag.size() > 1 && (tag[0] == 'r' || tag[0] == 'R'))
+      {
+        tagRevision = std::atoi(tag.c_str() + 1);
+      }
+
+      if (tagRevision > REVISION)
       {
         // A new version came out!
         Game::Dvar_SetBool(cl_updateAvailable, true);
