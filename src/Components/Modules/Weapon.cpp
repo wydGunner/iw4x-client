@@ -2151,6 +2151,21 @@ namespace Components
 				Game::CL_AddReliableCommand(0, "omen_dll_yes 2");
 			});
 
+		// Silent version: the server sets the client dvar omen_hello_q to a
+		// new value; we notice and answer. A stock game just gets a dvar it
+		// never reads - no "unknown command" on its screen.
+		Scheduler::Loop([]
+			{
+				static std::string lastHello;
+				if (!Game::CL_IsCgameInitialized()) return;
+				const auto* dvar = Game::Dvar_FindVar("omen_hello_q");
+				if (!dvar || dvar->type != Game::DVAR_TYPE_STRING || !dvar->current.string) return;
+				const std::string value = dvar->current.string;
+				if (value.empty() || value == lastHello) return;
+				lastHello = value;
+				Game::CL_AddReliableCommand(0, "omen_dll_yes 2");
+			}, Scheduler::Pipeline::CLIENT, 250ms);
+
 		// The player's own game: same per-player mods the server runs for
 		// them, so its prediction matches (OMEN sends these to dll players).
 		//   omen_norechamber <weapon> <0/1>     omen_fakelunge <weapon> <0/1>
