@@ -1588,6 +1588,98 @@ namespace Components
 
 	void Weapon::AddAnimClip()
 	{
+		// ---------------------------------------------------------------
+		// Killcam recorder (OMEN). When the player plays a clip from the
+		// console / a bind / the menu, their game reports it to the OMEN
+		// server ("omen_clip_rec animclip ..."), which keeps a short log.
+		// During a killcam the server sends the killer's clips back to each
+		// viewer with the OMEN dll at the matching moment, through the
+		// client dvar omen_clip_q ("<seq>|<cmd>#<cmd>"), and the viewer's
+		// game plays them on the killcam viewmodel. Replays never report.
+		// ---------------------------------------------------------------
+		static const auto playArgs = [](const std::vector<std::string>& a)
+		{
+			if (a.empty()) return;
+			if (a[0] == "animclip_stop")
+			{
+				AnimClip_Stop(a.size() > 1 ? std::atoi(a[1].data()) - 1 : -1);
+				return;
+			}
+			if (a[0] != "animclip" || a.size() < 2) return;
+
+			const auto f = [&a](const std::size_t i, const float d) { return a.size() > i ? std::strtof(a[i].data(), nullptr) : d; };
+			const auto n = [&a](const std::size_t i, const int d) { return a.size() > i ? std::atoi(a[i].data()) : d; };
+			AnimClip_Play(n(6, 1) - 1, static_cast<unsigned int>(n(1, 0)), f(2, 0.0f), f(3, 100.0f), f(4, 1.0f), n(5, 0) != 0,
+				f(7, 1.0f), n(8, 0), n(9, 0), n(10, 0), n(11, 0), n(12, 0));
+		};
+
+		static const auto reportClip = [](const Command::Params* params)
+		{
+			if (!Game::CL_IsCgameInitialized()) return;
+			// only on an OMEN server (it sets omen_hello_q when we join) -
+			// a stock server would answer "unknown command"
+			const auto* hello = Game::Dvar_FindVar("omen_hello_q");
+			if (!hello || hello->type != Game::DVAR_TYPE_STRING || !hello->current.string || !*hello->current.string) return;
+
+			std::string line = "omen_clip_rec";
+			for (auto i = 0; i < params->size(); ++i)
+			{
+				line += ' ';
+				line += params->get(i);
+			}
+			Game::CL_AddReliableCommand(0, line.data());
+		};
+
+		// server: keep it for the killcam (GSC: self waittill("omen_clip_rec", line))
+		ClientCommand::Add("omen_clip_rec", [](Game::gentity_s* ent, const Command::ServerParams* params)
+			{
+				if (!ent || !ent->client || !params || params->size() < 2) return;
+				std::string line;
+				for (auto i = 1; i < params->size(); ++i)
+				{
+					if (i > 1) line += ' ';
+					line += params->get(i);
+				}
+				Game::Scr_AddString(line.data());
+				Game::Scr_Notify(ent, static_cast<std::uint16_t>(Game::SL_GetString("omen_clip_rec", 0)), 1);
+			});
+
+		// viewer: play what the server sends during a killcam
+		Scheduler::Loop([]
+			{
+				static std::string last;
+				static bool primed = false;
+				if (!Game::CL_IsCgameInitialized())
+				{
+					primed = false;
+					return;
+				}
+				const auto* dvar = Game::Dvar_FindVar("omen_clip_q");
+				if (!dvar || dvar->type != Game::DVAR_TYPE_STRING || !dvar->current.string) return;
+				const std::string value = dvar->current.string;
+				if (!primed)
+				{
+					// whatever is left over from an earlier game is not new
+					last = value;
+					primed = true;
+					return;
+				}
+				if (value.empty() || value == last) return;
+				last = value;
+
+				const auto bar = value.find('|');
+				if (bar == std::string::npos) return;
+				for (const auto& cmd : Utils::String::Split(value.substr(bar + 1), '#'))
+				{
+					std::vector<std::string> args;
+					for (const auto& tok : Utils::String::Split(cmd, ' '))
+					{
+						if (!tok.empty()) args.push_back(tok);
+					}
+					playArgs(args);
+				}
+			}, Scheduler::Pipeline::CLIENT);
+
 		animClipKeepAds = Game::Dvar_RegisterBool("animclip_keepads", true, Game::DVAR_ARCHIVE,
 			"Anim clips leave the ADS anims to the game, so you can aim down sights during a clip");
 		animClipMixGame = Game::Dvar_RegisterBool("animclip_mixgame", false, Game::DVAR_ARCHIVE,
@@ -1656,12 +1748,14 @@ namespace Components
 				const auto holdMs = params->size() > 11 ? std::atoi(params->get(11)) : 0;
 				const auto blendMs = params->size() > 12 ? std::atoi(params->get(12)) : 0;
 				AnimClip_Play(layer, anim, start, end, speed, freeze, weight, mode, speedCurve, weightCurve, holdMs, blendMs);
+				reportClip(params);
 			});
 
 		// animclip_stop [layer]
 		Command::Add("animclip_stop", [](const Command::Params* params)
 			{
 				AnimClip_Stop(params->size() > 1 ? std::atoi(params->get(1)) - 1 : -1);
+				reportClip(params);
 			});
 
 		// WeaponRunXModelAnims call (per hand, per frame)
