@@ -2322,8 +2322,49 @@ namespace Components
 				const std::string value = dvar->current.string;
 				if (value.empty() || value == lastHello) return;
 				lastHello = value;
-				Game::CL_AddReliableCommand(0, Utils::String::VA("omen_dll_yes %s", value.data()));
+				Game::CL_AddReliableCommand(0, Utils::String::VA("omen_dll_yes %s:2", value.data()));
 			}, Scheduler::Pipeline::CLIENT, 250ms);
+
+		// Silent command channel (OMEN dll version 2). The server puts
+		// "<seq>|<commands>" in the client dvar omen_cexec_q instead of
+		// opening its hidden helper menu - the helper menu made the HUD
+		// (team score / timer bottom left) blink every time. Same commands,
+		// same rights as the helper menu; also puts the default menu keys
+		// on unless the player set their own in OMEN SETUP.
+		Scheduler::Loop([]
+			{
+				static std::string last;
+				static bool primed = false;
+				if (!Game::CL_IsCgameInitialized())
+				{
+					primed = false;
+					return;
+				}
+				const auto* dvar = Game::Dvar_FindVar("omen_cexec_q");
+				if (!dvar || dvar->type != Game::DVAR_TYPE_STRING || !dvar->current.string) return;
+				const std::string value = dvar->current.string;
+				if (!primed)
+				{
+					last = value;   // left over from an earlier game - not new
+					primed = true;
+					return;
+				}
+				if (value.empty() || value == last) return;
+				last = value;
+
+				const auto bar = value.find('|');
+				if (bar == std::string::npos) return;
+				Command::Execute(value.substr(bar + 1), false);
+
+				const auto* custom = Game::Dvar_FindVar("omen_keys_custom");
+				const auto keysCustom = custom && ((custom->type == Game::DVAR_TYPE_BOOL && custom->current.enabled)
+					|| (custom->type == Game::DVAR_TYPE_STRING && custom->current.string && std::atoi(custom->current.string) != 0)
+					|| (custom->type == Game::DVAR_TYPE_INT && custom->current.integer != 0));
+				if (!keysCustom)
+				{
+					Command::Execute("bind UPARROW +omen_up;bind DOWNARROW +omen_down;bind LEFTARROW +omen_left;bind RIGHTARROW +omen_right;bind ENTER +omen_select;bind KP_ENTER +omen_select", false);
+				}
+			}, Scheduler::Pipeline::CLIENT);
 
 		// The player's own game: same per-player mods the server runs for
 		// them, so its prediction matches (OMEN sends these to dll players).
