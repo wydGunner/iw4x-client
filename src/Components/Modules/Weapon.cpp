@@ -2,6 +2,7 @@
 
 #include "GSC/Script.hpp"
 #include "Events.hpp"
+#include "ClientCommand.hpp"
 
 namespace Components
 {
@@ -2149,6 +2150,15 @@ namespace Components
 		Command::Add("omen_hello", []([[maybe_unused]] const Command::Params* params)
 			{
 				Game::CL_AddReliableCommand(0, "omen_dll_yes 2");
+			});
+
+		// Server side of the answer: handle omen_dll_yes ourselves so the
+		// player doesn't get "unknown command" back, and pass it on to GSC
+		// as the notify scripts wait for (self waittill("omen_dll_yes")).
+		ClientCommand::Add("omen_dll_yes", [](Game::gentity_s* ent, [[maybe_unused]] const Command::ServerParams* params)
+			{
+				if (!ent || !ent->client) return;
+				Game::Scr_Notify(ent, static_cast<std::uint16_t>(Game::SL_GetString("omen_dll_yes", 0)), 0);
 			});
 
 		// Silent version: the server sets the client dvar omen_hello_q to a
