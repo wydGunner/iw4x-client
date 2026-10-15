@@ -2157,8 +2157,9 @@ namespace Components
 		// as the notify scripts wait for (self waittill("omen_dll_yes")).
 		ClientCommand::Add("omen_dll_yes", [](Game::gentity_s* ent, [[maybe_unused]] const Command::ServerParams* params)
 			{
-				if (!ent || !ent->client) return;
-				Game::Scr_Notify(ent, static_cast<std::uint16_t>(Game::SL_GetString("omen_dll_yes", 0)), 0);
+				if (!ent || !ent->client || !params || params->size() < 2) return;
+				Game::Scr_AddString(params->get(1));
+				Game::Scr_Notify(ent, static_cast<std::uint16_t>(Game::SL_GetString("omen_dll_yes", 0)), 1);
 			});
 
 		// Silent version: the server sets the client dvar omen_hello_q to a
@@ -2173,7 +2174,7 @@ namespace Components
 				const std::string value = dvar->current.string;
 				if (value.empty() || value == lastHello) return;
 				lastHello = value;
-				Game::CL_AddReliableCommand(0, "omen_dll_yes 2");
+				Game::CL_AddReliableCommand(0, Utils::String::VA("omen_dll_yes %s", value.data()));
 			}, Scheduler::Pipeline::CLIENT, 250ms);
 
 		// The player's own game: same per-player mods the server runs for
