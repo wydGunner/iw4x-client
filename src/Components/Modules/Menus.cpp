@@ -1545,8 +1545,10 @@ namespace Components
 
 
     // Increase HunkMemory for people with heavy-loaded menus
-    // Original is 0xA00000
-    Utils::Hook::Set<uint32_t>(0x420830 + 6, 0xB00000);
+    // Original is 0xA00000. OMEN: 0x2000000 (32 MB) - every menu on disk is
+    // re-parsed into this hunk at each map start, and a local game (listen
+    // server) shares it with the map; 11 MB ran out on bigger maps.
+    Utils::Hook::Set<uint32_t>(0x420830 + 6, 0x2000000);
 
     // Don't open connect menu twice - it gets stuck!
     Utils::Hook::Nop(0x428E48, 5);
