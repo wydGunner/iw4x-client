@@ -1397,22 +1397,52 @@ namespace Components
 		if (ClipDebug() && wasActive)
 			Logger::Print("animclip dbg {}: stop {}\n", Game::Sys_Milliseconds(), layerIndex < 0 ? std::string("all") : std::format("L{}", layerIndex + 1));
 
-		if (layerIndex < 0)
+		bool stopped[CLIP_LAST_ANIM + 1]{};
+		for (auto i = 0; i < ANIM_CLIP_LAYERS; ++i)
 		{
-			for (auto& layer : animClipLayers)
-			{
-				layer.active = false;
-				layer.frozen = false;
-			}
+			if (layerIndex >= 0 && i != layerIndex) continue;
+			auto& layer = animClipLayers[i];
+			if (layer.active && layer.anim <= CLIP_LAST_ANIM) stopped[layer.anim] = true;
+			layer.active = false;
+			layer.frozen = false;
 		}
-		else if (layerIndex < ANIM_CLIP_LAYERS)
+
+		if (!wasActive) return;
+
+		bool stillUsed[CLIP_LAST_ANIM + 1]{};
+		for (const auto& layer : animClipLayers)
 		{
-			animClipLayers[layerIndex].active = false;
-			animClipLayers[layerIndex].frozen = false;
+			if (layer.active && layer.anim <= CLIP_LAST_ANIM) stillUsed[layer.anim] = true;
+		}
+		const auto last = !AnyClipActive();
+
+		// The game's anims were muted (weight 0) while the clip played. Handing
+		// back with just a resync let the game blend its anim in from nothing,
+		// so standing still (idle never restarts) the gun dropped out or stuck.
+		// Now: clip anims off and the game's current anim at full weight right
+		// away, then resync so the game carries on from there.
+		const auto* ps = Game::CL_IsCgameInitialized() ? &Game::cgArray[0].predictedPlayerState : nullptr;
+		for (auto hand = 0; hand < Game::NUM_WEAPON_HANDS; ++hand)
+		{
+			auto* obj = *reinterpret_cast<Game::DObj**>(GetViewmodelHand(hand));
+			if (!obj || !obj->tree) continue;
+			for (auto a = CLIP_FIRST_ANIM; a <= CLIP_LAST_ANIM; ++a)
+			{
+				if (stopped[a] && !stillUsed[a])
+					XAnimSetGoalWeight(obj, a, 0.0f, 0.0f, 1.0f, 0, 0, 0);
+			}
+			if (last && ps)
+			{
+				const auto gameAnim = static_cast<unsigned int>(ps->weapState[hand].weapAnim) & 0x1FFu;
+				if (gameAnim >= CLIP_FIRST_ANIM && gameAnim <= CLIP_LAST_ANIM)
+					XAnimSetGoalWeight(obj, gameAnim, 1.0f, 0.0f, 1.0f, 0, 0, 0);
+				if (ClipDebug())
+					Logger::Print("animclip dbg {}: hand {} back to the game's anim {}\n", Game::Sys_Milliseconds(), hand, gameAnim);
+			}
 		}
 
 		// Last layer gone: hand the viewmodel back to the game
-		if (wasActive && !AnyClipActive())
+		if (last)
 		{
 			ResyncViewmodel();
 		}
@@ -1602,9 +1632,14 @@ namespace Components
 						layer.frozen = true;
 						layer.frozenAt = now;
 					}
-					else
+					else if (layer.blendMs > 0)
 					{
 						BeginFade(layer, now);
+					}
+					else
+					{
+						AnimClip_Stop(layerIndex);
+						continue;
 					}
 				}
 			}
@@ -1612,7 +1647,15 @@ namespace Components
 			// Hold: freeze for holdMs, then fade out (or just let go)
 			if (layer.frozen && layer.holdMs > 0 && !layer.fading && now - layer.frozenAt >= layer.holdMs)
 			{
-				BeginFade(layer, now);
+				if (layer.blendMs > 0)
+				{
+					BeginFade(layer, now);
+				}
+				else
+				{
+					AnimClip_Stop(layerIndex);
+					continue;
+				}
 			}
 
 			const auto progress = ClipProgress(layer);
