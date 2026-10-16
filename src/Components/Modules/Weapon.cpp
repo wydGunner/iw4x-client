@@ -1309,7 +1309,6 @@ namespace Components
 			layer.fading = true;
 			layer.fadeAt = now;
 			layer.fadeMs = layer.blendMs > 0 ? layer.blendMs : CLIP_HANDBACK_MS;
-			ResyncViewmodel();
 		}
 
 		bool AnyClipActive()
@@ -1489,12 +1488,27 @@ namespace Components
 
 		bool used[CLIP_LAST_ANIM + 1]{};
 		auto anyOnHand = false;
+		auto anyPlaying = false;     // a layer on this hand that isn't fading out
+		auto handBack = 1.0f;        // how far the fading layers are (0..1)
 		for (const auto& layer : animClipLayers)
 		{
 			if (!layer.active || !LayerOnHand(layer, hand)) continue;
 			used[layer.anim] = true;
-			// a layer handing the gun back doesn't mute the game's anims
-			if (!layer.fading) anyOnHand = true;
+			anyOnHand = true;
+			if (!layer.fading)
+				anyPlaying = true;
+			else
+				handBack = std::min(handBack, std::clamp(static_cast<float>(now - layer.fadeAt) / static_cast<float>(std::max(layer.fadeMs, 1)), 0.0f, 1.0f));
+		}
+
+		// Only fading layers left: bring the game's own anim (idle, sprint...)
+		// back in under them, so the gun is never left with nothing holding it.
+		auto gameAnim = 0u;
+		if (anyOnHand && !anyPlaying && ps)
+		{
+			gameAnim = static_cast<unsigned int>(ps->weapState[hand].weapAnim) & 0x1FFu;   // drop the toggle bit
+			if (gameAnim < CLIP_FIRST_ANIM || gameAnim > CLIP_LAST_ANIM || used[gameAnim])
+				gameAnim = 0;
 		}
 
 		// Runs right after the game's own anim update, so anything it just
@@ -1503,10 +1517,14 @@ namespace Components
 		for (auto i = CLIP_FIRST_ANIM; i <= CLIP_LAST_ANIM && anyOnHand; ++i)
 		{
 			if (used[i]) continue;
+			if (i == gameAnim) continue;
 			if (mixGame) break;
 			if (keepAds && IsAdsAnim(i)) continue;
 			XAnimSetGoalWeight(obj, i, 0.0f, 0.0f, 1.0f, 0, 0, 0);
 		}
+
+		if (gameAnim)
+			XAnimSetGoalWeight(obj, gameAnim, std::max(handBack, 0.001f), 0.0f, 1.0f, 0, 0, 0);
 
 		for (auto layerIndex = 0; layerIndex < ANIM_CLIP_LAYERS; ++layerIndex)
 		{
