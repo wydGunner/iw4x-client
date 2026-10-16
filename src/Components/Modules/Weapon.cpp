@@ -1314,6 +1314,7 @@ namespace Components
 			bool pendingStart;
 			float pos;        // anim time we put it at
 			float lastSet;    // what we set last frame (engine advances from it)
+			int lastTick;     // ms of the last step (own clock when the engine's stands still)
 			int dir;          // +1 / -1
 			bool bounced;     // ping-pong: on the way back
 			int startedAt;
@@ -1363,6 +1364,34 @@ namespace Components
 			layer.fading = true;
 			layer.fadeAt = now;
 			layer.fadeMs = layer.blendMs > 0 ? layer.blendMs : CLIP_HANDBACK_MS;
+		}
+
+		// How many times a second this weapon's anim plays through (1 / length),
+		// from its XAnimParts. 0 if unknown.
+		float ClipAnimFrequency(const Game::playerState_s* ps, const int hand, const unsigned int anim)
+		{
+			if (!ps) return 0.0f;
+			const auto weapon = ps->weapCommon.weapon;
+			static unsigned int cachedWeapon = 0xFFFFFFFF;
+			static float cache[Game::NUM_WEAPON_HANDS][CLIP_LAST_ANIM + 1]{};
+			if (weapon != cachedWeapon)
+			{
+				cachedWeapon = weapon;
+				for (auto& h : cache) for (auto& f : h) f = -1.0f;
+			}
+			auto& slot = cache[hand][anim];
+			if (slot >= 0.0f) return slot;
+			slot = 0.0f;
+			const auto* def = Game::BG_GetWeaponDef(weapon);
+			if (!def) return slot;
+			const auto* const* names = (hand == 1 && def->szXAnimsLeftHanded) ? def->szXAnimsLeftHanded : def->szXAnimsRightHanded;
+			if (!names || !names[anim] || !*names[anim]) return slot;
+			const auto header = Game::DB_FindXAssetHeader(Game::ASSET_TYPE_XANIMPARTS, names[anim]);
+			const auto* parts = header.parts;
+			if (!parts) return slot;
+			if (parts->frequency > 0.0f) slot = parts->frequency;
+			else if (parts->numframes > 0 && parts->framerate > 0.0f) slot = parts->framerate / static_cast<float>(parts->numframes);
+			return slot;
 		}
 
 		bool AnyClipActive()
@@ -1434,6 +1463,7 @@ namespace Components
 		layer.outRate = 0.0f;
 		layer.pendingStart = true;
 		layer.startedAt = Game::Sys_Milliseconds();
+		layer.lastTick = layer.startedAt;
 		layer.active = true;
 
 		if (ClipDebug())
@@ -1638,6 +1668,21 @@ namespace Components
 				auto step = XAnimGetTime(tree, anim) - layer.lastSet;
 				if (step < -0.5f) step += 1.0f;   // looping anim wrapped past 1.0
 				step = std::clamp(step, 0.0f, 0.1f);
+
+				// Standing still the game doesn't tick the viewmodel's anims, so
+				// the engine moves nothing and the clip froze (and the killcam
+				// got nothing). Then run it on our own clock from the anim's length.
+				const auto dt = static_cast<float>(now - layer.lastTick) / 1000.0f;
+				if (step <= 0.0f && dt > 0.0f)
+				{
+					const auto freq = ClipAnimFrequency(ps, hand, anim);
+					if (freq > 0.0f)
+					{
+						const auto u = ClipProgress(layer);
+						step = std::clamp(dt * freq * layer.speed * ClipSpeedCurve(layer.speedCurve, u), 0.0f, 0.1f);
+					}
+				}
+				layer.lastTick = now;
 
 				layer.pos += static_cast<float>(layer.dir) * step;
 
