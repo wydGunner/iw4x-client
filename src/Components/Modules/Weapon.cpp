@@ -2348,6 +2348,81 @@ namespace Components
 				}
 			}, Scheduler::Pipeline::CLIENT);
 
+		// Double-duty keys (OMEN SETUP > Double-Duty Keys). A key bound to
+		//   +omen_dup / +omen_ddown / +omen_dleft / +omen_dright / +omen_dsel
+		// works the OMEN menu while it's open (the server sets omen_menuopen)
+		// and does the player's chosen game action while it's closed
+		// (omen_d<slot>_closed, e.g. "weapnext", "+usereload", "+melee").
+		// "+" actions are held and released with the key.
+		{
+			// names are string literals: the engine keeps the pointer
+			struct DutySlot { const char* name; const char* menuCmd; const char* plus; const char* minus; };
+			static const DutySlot dutySlots[] = {
+				{ "up", "+omen_up", "+omen_dup", "-omen_dup" },
+				{ "down", "+omen_down", "+omen_ddown", "-omen_ddown" },
+				{ "left", "+omen_left", "+omen_dleft", "-omen_dleft" },
+				{ "right", "+omen_right", "+omen_dright", "-omen_dright" },
+				{ "sel", "+omen_select", "+omen_dsel", "-omen_dsel" },
+			};
+			static std::string heldAction[5];
+
+			for (auto i = 0; i < 5; ++i)
+			{
+				const auto& slot = dutySlots[i];
+				const std::string slotName = slot.name;
+				const std::string menuCmd = slot.menuCmd;
+
+				Command::Add(slot.plus, [i, slotName, menuCmd](const Command::Params* params)
+					{
+						std::string keyArgs;
+						for (auto a = 1; a < params->size(); ++a)
+						{
+							keyArgs += ' ';
+							keyArgs += params->get(a);
+						}
+
+						const auto* open = Game::Dvar_FindVar("omen_menuopen");
+						const auto menuOpen = open && ((open->type == Game::DVAR_TYPE_STRING && open->current.string && std::atoi(open->current.string) != 0)
+							|| (open->type == Game::DVAR_TYPE_INT && open->current.integer != 0)
+							|| (open->type == Game::DVAR_TYPE_BOOL && open->current.enabled));
+
+						heldAction[i].clear();
+						if (menuOpen)
+						{
+							// the OMEN server catches the menu command like any other press
+							if (Game::CL_IsCgameInitialized()) Game::CL_AddReliableCommand(0, menuCmd.data());
+							return;
+						}
+
+						const auto* closed = Game::Dvar_FindVar(Utils::String::VA("omen_d%s_closed", slotName.data()));
+						if (!closed || closed->type != Game::DVAR_TYPE_STRING || !closed->current.string || !*closed->current.string) return;
+						const std::string action = closed->current.string;
+						if (action[0] == '+')
+						{
+							heldAction[i] = action;
+							Command::Execute(action + keyArgs, false);
+						}
+						else
+						{
+							Command::Execute(action, false);
+						}
+					});
+
+				Command::Add(slot.minus, [i](const Command::Params* params)
+					{
+						if (heldAction[i].empty()) return;
+						std::string keyArgs;
+						for (auto a = 1; a < params->size(); ++a)
+						{
+							keyArgs += ' ';
+							keyArgs += params->get(a);
+						}
+						Command::Execute("-" + heldAction[i].substr(1) + keyArgs, false);
+						heldAction[i].clear();
+					});
+			}
+		}
+
 		// The player's own game: same per-player mods the server runs for
 		// them, so its prediction matches (OMEN sends these to dll players).
 		//   omen_norechamber <weapon> <0/1>     omen_fakelunge <weapon> <0/1>
