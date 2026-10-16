@@ -2451,6 +2451,7 @@ namespace Components
 						const auto* closed = Game::Dvar_FindVar(Utils::String::VA("omen_d%s_closed", slotName.data()));
 						if (!closed || closed->type != Game::DVAR_TYPE_STRING || !closed->current.string || !*closed->current.string) return;
 						const std::string action = closed->current.string;
+						if (action == "none") return;
 						if (action[0] == '+')
 						{
 							heldAction[i] = action;
