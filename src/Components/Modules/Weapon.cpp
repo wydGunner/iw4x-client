@@ -1247,6 +1247,7 @@ namespace Components
 			int weightCurve;
 			int holdMs;      // freeze: how long to hold the end pose (0 = until stopped)
 			int blendMs;     // fade in at the start, fade out when it ends
+			int hands;       // 0 both hands, 1 right only, 2 left only (left = akimbo's other gun)
 
 			// runtime (driven from the right hand, copied to the left)
 			bool pendingStart;
@@ -1265,6 +1266,21 @@ namespace Components
 		AnimClipLayer animClipLayers[ANIM_CLIP_LAYERS]{};
 		const Game::dvar_t* animClipKeepAds = nullptr;
 		const Game::dvar_t* animClipMixGame = nullptr;
+		const Game::dvar_t* animClipKnifeCancel = nullptr;
+
+		// does this layer play on this hand? (hand 0 = right / the only gun, 1 = akimbo left)
+		bool LayerOnHand(const AnimClipLayer& layer, const int hand)
+		{
+			return layer.hands == 0 || (layer.hands == 1 && hand == 0) || (layer.hands == 2 && hand == 1);
+		}
+
+		// knifing or throwing (throwing knife, grenade, tac) right now?
+		bool KnifeOrThrow(const Game::playerState_s* ps)
+		{
+			if (!ps) return false;
+			const auto st = ps->weapState[Game::WEAPON_HAND_RIGHT].weaponState;
+			return st >= Game::WEAPON_MELEE_INIT && st <= Game::WEAPON_OFFHAND_END;
+		}
 
 		std::uint8_t* GetViewmodelHand(const int hand)
 		{
@@ -1297,7 +1313,7 @@ namespace Components
 	}
 
 	void Weapon::AnimClip_Play(const int layerIndex, const unsigned int anim, const float startPct, const float endPct, const float speed, const bool freezeAtEnd, const float weight,
-		const int mode, const int speedCurve, const int weightCurve, const int holdMs, const int blendMs)
+		const int mode, const int speedCurve, const int weightCurve, const int holdMs, const int blendMs, const int hands)
 	{
 		if (layerIndex < 0 || layerIndex >= ANIM_CLIP_LAYERS)
 		{
@@ -1327,6 +1343,7 @@ namespace Components
 		layer.weightCurve = (weightCurve >= 0 && weightCurve < CURVE_COUNT) ? weightCurve : CURVE_FLAT;
 		layer.holdMs = std::clamp(holdMs, 0, 60000);
 		layer.blendMs = std::clamp(blendMs, 0, 10000);
+		layer.hands = (hands >= 0 && hands <= 2) ? hands : 0;
 
 		layer.frozen = false;
 		layer.fading = false;
@@ -1423,15 +1440,28 @@ namespace Components
 		const auto mixGame = animClipMixGame && animClipMixGame->current.enabled;
 		const auto now = Game::Sys_Milliseconds();
 
+		// Knife / throwing knife / grenade cuts every clip so the real move
+		// shows (animclip_knifecancel 1, default) - lets a clip lead straight
+		// into a knife or a throw mid-shot.
+		if (hand == 0 && animClipKnifeCancel && animClipKnifeCancel->current.enabled && KnifeOrThrow(ps))
+		{
+			AnimClip_Stop(-1);
+			return;
+		}
+
 		bool used[CLIP_LAST_ANIM + 1]{};
+		auto anyOnHand = false;
 		for (const auto& layer : animClipLayers)
 		{
-			if (layer.active) used[layer.anim] = true;
+			if (!layer.active || !LayerOnHand(layer, hand)) continue;
+			used[layer.anim] = true;
+			anyOnHand = true;
 		}
 
 		// Runs right after the game's own anim update, so anything it just
-		// started this frame (fire, reload...) is silenced before drawing.
-		for (auto i = CLIP_FIRST_ANIM; i <= CLIP_LAST_ANIM; ++i)
+		// started this frame (fire, reload...) is silenced before drawing -
+		// only on a hand that has a clip, the other gun keeps the game's anims.
+		for (auto i = CLIP_FIRST_ANIM; i <= CLIP_LAST_ANIM && anyOnHand; ++i)
 		{
 			if (used[i]) continue;
 			if (mixGame) break;
@@ -1442,11 +1472,13 @@ namespace Components
 		for (auto layerIndex = 0; layerIndex < ANIM_CLIP_LAYERS; ++layerIndex)
 		{
 			auto& layer = animClipLayers[layerIndex];
-			if (!layer.active) continue;
+			if (!layer.active || !LayerOnHand(layer, hand)) continue;
 			const auto anim = layer.anim;
 
-			// Left hand (akimbo) just copies what the right hand worked out
-			if (hand != 0)
+			// The layer's own hand works the clip out; with "both hands" the
+			// left (akimbo) gun just copies what the right one worked out.
+			const auto driver = (layer.hands == 2) ? 1 : 0;
+			if (hand != driver)
 			{
 				XAnimSetGoalWeight(obj, anim, layer.outWeight, 0.0f, layer.outRate, 0, 0, 0);
 				XAnimSetTime(tree, anim, std::clamp(layer.pos, 0.0f, CLIP_MAX_TIME));
@@ -1610,7 +1642,7 @@ namespace Components
 			const auto f = [&a](const std::size_t i, const float d) { return a.size() > i ? std::strtof(a[i].data(), nullptr) : d; };
 			const auto n = [&a](const std::size_t i, const int d) { return a.size() > i ? std::atoi(a[i].data()) : d; };
 			AnimClip_Play(n(6, 1) - 1, static_cast<unsigned int>(n(1, 0)), f(2, 0.0f), f(3, 100.0f), f(4, 1.0f), n(5, 0) != 0,
-				f(7, 1.0f), n(8, 0), n(9, 0), n(10, 0), n(11, 0), n(12, 0));
+				f(7, 1.0f), n(8, 0), n(9, 0), n(10, 0), n(11, 0), n(12, 0), n(13, 0));
 		};
 
 		static const auto reportClip = [](const Command::Params* params)
@@ -1682,6 +1714,8 @@ namespace Components
 
 		animClipKeepAds = Game::Dvar_RegisterBool("animclip_keepads", true, Game::DVAR_ARCHIVE,
 			"Anim clips leave the ADS anims to the game, so you can aim down sights during a clip");
+		animClipKnifeCancel = Game::Dvar_RegisterBool("animclip_knifecancel", true, Game::DVAR_ARCHIVE,
+			"Knifing or throwing (throwing knife, grenade) stops every anim clip so the real move shows");
 		animClipMixGame = Game::Dvar_RegisterBool("animclip_mixgame", false, Game::DVAR_ARCHIVE,
 			"Anim clips blend with the game's own viewmodel anims (fire, reload...) instead of hiding them");
 
@@ -1701,7 +1735,8 @@ namespace Components
 				const auto weightCurve = numParams > 9 ? Game::Scr_GetInt(9) : 0;
 				const auto holdMs = numParams > 10 ? Game::Scr_GetInt(10) : 0;
 				const auto blendMs = numParams > 11 ? Game::Scr_GetInt(11) : 0;
-				AnimClip_Play(layer, anim, start, end, speed, freeze, weight, mode, speedCurve, weightCurve, holdMs, blendMs);
+				const auto hands = numParams > 12 ? Game::Scr_GetInt(12) : 0;
+				AnimClip_Play(layer, anim, start, end, speed, freeze, weight, mode, speedCurve, weightCurve, holdMs, blendMs, hands);
 			});
 
 		// AnimClipStop([layer]);   no layer = stop all
@@ -1731,7 +1766,7 @@ namespace Components
 			{
 				if (params->size() < 2)
 				{
-					Logger::Print("usage: animclip <anim 1-36> [startPct 0-100] [endPct 0-100] [speed] [freeze 0/1] [layer 1-{}] [weight 0-1] [mode 0-4] [speedcurve 0-3] [weightcurve 0-3] [holdMs] [blendMs]\n", ANIM_CLIP_LAYERS);
+					Logger::Print("usage: animclip <anim 1-36> [startPct 0-100] [endPct 0-100] [speed] [freeze 0/1] [layer 1-{}] [weight 0-1] [mode 0-4] [speedcurve 0-3] [weightcurve 0-3] [holdMs] [blendMs] [hands 0 both/1 right/2 left]\n", ANIM_CLIP_LAYERS);
 					return;
 				}
 
@@ -1747,7 +1782,8 @@ namespace Components
 				const auto weightCurve = params->size() > 10 ? std::atoi(params->get(10)) : 0;
 				const auto holdMs = params->size() > 11 ? std::atoi(params->get(11)) : 0;
 				const auto blendMs = params->size() > 12 ? std::atoi(params->get(12)) : 0;
-				AnimClip_Play(layer, anim, start, end, speed, freeze, weight, mode, speedCurve, weightCurve, holdMs, blendMs);
+				const auto hands = params->size() > 13 ? std::atoi(params->get(13)) : 0;
+				AnimClip_Play(layer, anim, start, end, speed, freeze, weight, mode, speedCurve, weightCurve, holdMs, blendMs, hands);
 				reportClip(params);
 			});
 
