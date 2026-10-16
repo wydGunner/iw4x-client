@@ -80,7 +80,7 @@ namespace Components
 
 		// Viewmodel anim clip player
 		static void AnimClip_Play(int layerIndex, unsigned int anim, float startPct, float endPct, float speed, bool freezeAtEnd, float weight,
-			int mode = 0, int speedCurve = 0, int weightCurve = 0, int holdMs = 0, int blendMs, int hands = 0 = 0);
+			int mode = 0, int speedCurve = 0, int weightCurve = 0, int holdMs = 0, int blendMs = 0, int hands = 0);
 		static void AnimClip_Stop(int layerIndex = -1);
 		static void AnimClip_Frame(Game::playerState_s* ps, int hand);
 		static void WeaponRunXModelAnims_Stub();
