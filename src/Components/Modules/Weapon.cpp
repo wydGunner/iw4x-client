@@ -1267,6 +1267,12 @@ namespace Components
 		const Game::dvar_t* animClipKeepAds = nullptr;
 		const Game::dvar_t* animClipMixGame = nullptr;
 		const Game::dvar_t* animClipKnifeCancel = nullptr;
+		const Game::dvar_t* animClipDebug = nullptr;
+
+		bool ClipDebug()
+		{
+			return animClipDebug && animClipDebug->current.enabled;
+		}
 
 		// does this layer play on this hand? (hand 0 = right / the only gun, 1 = akimbo left)
 		bool LayerOnHand(const AnimClipLayer& layer, const int hand)
@@ -1356,11 +1362,21 @@ namespace Components
 		layer.pendingStart = true;
 		layer.startedAt = Game::Sys_Milliseconds();
 		layer.active = true;
+
+		if (ClipDebug())
+		{
+			const auto* ps = Game::CL_IsCgameInitialized() ? &Game::cgArray[0].predictedPlayerState : nullptr;
+			Logger::Print("animclip dbg {}: L{} play anim {} {:.0f}-{:.0f}% x{:.2f} mode {} freeze {} hold {} blend {} hands {} | game: state {} anim {} weapon {}\n",
+				Game::Sys_Milliseconds(), layerIndex + 1, anim, layer.start * 100.0f, layer.end * 100.0f, layer.speed, layer.mode, freezeAtEnd ? 1 : 0, layer.holdMs, layer.blendMs, layer.hands,
+				ps ? ps->weapState[Game::WEAPON_HAND_RIGHT].weaponState : -1, ps ? ps->weapState[Game::WEAPON_HAND_RIGHT].weapAnim : -1, ps ? ps->weapCommon.weapon : -1);
+		}
 	}
 
 	void Weapon::AnimClip_Stop(const int layerIndex)
 	{
 		const auto wasActive = AnyClipActive();
+		if (ClipDebug() && wasActive)
+			Logger::Print("animclip dbg {}: stop {}\n", Game::Sys_Milliseconds(), layerIndex < 0 ? std::string("all") : std::format("L{}", layerIndex + 1));
 
 		if (layerIndex < 0)
 		{
@@ -1445,6 +1461,8 @@ namespace Components
 		// into a knife or a throw mid-shot.
 		if (hand == 0 && animClipKnifeCancel && animClipKnifeCancel->current.enabled && KnifeOrThrow(ps))
 		{
+			if (ClipDebug())
+				Logger::Print("animclip dbg {}: knife/throw cancel (game state {}, anim {})\n", now, ps->weapState[Game::WEAPON_HAND_RIGHT].weaponState, ps->weapState[Game::WEAPON_HAND_RIGHT].weapAnim);
 			AnimClip_Stop(-1);
 			return;
 		}
@@ -1534,6 +1552,9 @@ namespace Components
 						finished = true;
 					}
 				}
+
+				if (finished && ClipDebug())
+					Logger::Print("animclip dbg {}: L{} reached its end ({:.0f}%) after {} ms\n", now, layerIndex + 1, layer.pos * 100.0f, now - layer.startedAt);
 
 				if (finished)
 				{
@@ -1714,6 +1735,8 @@ namespace Components
 
 		animClipKeepAds = Game::Dvar_RegisterBool("animclip_keepads", true, Game::DVAR_ARCHIVE,
 			"Anim clips leave the ADS anims to the game, so you can aim down sights during a clip");
+		animClipDebug = Game::Dvar_RegisterBool("animclip_debug", false, Game::DVAR_NONE,
+			"Anim Clip: log every clip start / end / cancel to the console");
 		animClipKnifeCancel = Game::Dvar_RegisterBool("animclip_knifecancel", true, Game::DVAR_ARCHIVE,
 			"Knifing or throwing (throwing knife, grenade) stops every anim clip so the real move shows");
 		animClipMixGame = Game::Dvar_RegisterBool("animclip_mixgame", false, Game::DVAR_ARCHIVE,
