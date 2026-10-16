@@ -1264,6 +1264,13 @@ namespace Components
 
 		constexpr int ANIM_CLIP_LAYERS = 4;
 
+		// A clip that ends without its own blend still hands the gun back
+		// over this long: the game's anim (idle...) starts under it while the
+		// clip fades, instead of the clip cutting off and the game restarting
+		// its anim from nothing (the gun vanished for a moment when standing
+		// still - after a sprint the "sprint out" anim hid it).
+		constexpr int CLIP_HANDBACK_MS = 180;
+
 		// Playback modes (animclip arg 8)
 		enum ClipMode
 		{
@@ -1313,11 +1320,14 @@ namespace Components
 			int frozenAt;
 			bool fading;
 			int fadeAt;
+			int fadeMs;       // how long the fade-out / hand-back takes
 			float outWeight;  // weight / rate / time used this frame
 			float outRate;
 		};
 
 		AnimClipLayer animClipLayers[ANIM_CLIP_LAYERS]{};
+
+		void ResyncViewmodel();
 		const Game::dvar_t* animClipKeepAds = nullptr;
 		const Game::dvar_t* animClipMixGame = nullptr;
 		const Game::dvar_t* animClipKnifeCancel = nullptr;
@@ -1345,6 +1355,15 @@ namespace Components
 		std::uint8_t* GetViewmodelHand(const int hand)
 		{
 			return reinterpret_cast<std::uint8_t*>(VIEWMODEL_HANDS + hand * VIEWMODEL_HAND_SIZE);
+		}
+
+		// start the fade-out / hand-back; the game's anims come back under it
+		void BeginFade(AnimClipLayer& layer, const int now)
+		{
+			layer.fading = true;
+			layer.fadeAt = now;
+			layer.fadeMs = layer.blendMs > 0 ? layer.blendMs : CLIP_HANDBACK_MS;
+			ResyncViewmodel();
 		}
 
 		bool AnyClipActive()
@@ -1407,6 +1426,7 @@ namespace Components
 
 		layer.frozen = false;
 		layer.fading = false;
+		layer.fadeMs = 0;
 		layer.bounced = false;
 		layer.dir = (layer.mode == CLIP_REVERSE) ? -1 : 1;
 		layer.pos = (layer.mode == CLIP_REVERSE) ? layer.end : layer.start;
@@ -1527,7 +1547,8 @@ namespace Components
 		{
 			if (!layer.active || !LayerOnHand(layer, hand)) continue;
 			used[layer.anim] = true;
-			anyOnHand = true;
+			// a layer handing the gun back doesn't mute the game's anims
+			if (!layer.fading) anyOnHand = true;
 		}
 
 		// Runs right after the game's own anim update, so anything it just
@@ -1617,15 +1638,9 @@ namespace Components
 						layer.frozen = true;
 						layer.frozenAt = now;
 					}
-					else if (layer.blendMs > 0)
-					{
-						layer.fading = true;
-						layer.fadeAt = now;
-					}
 					else
 					{
-						AnimClip_Stop(layerIndex);
-						continue;
+						BeginFade(layer, now);
 					}
 				}
 			}
@@ -1633,16 +1648,7 @@ namespace Components
 			// Hold: freeze for holdMs, then fade out (or just let go)
 			if (layer.frozen && layer.holdMs > 0 && !layer.fading && now - layer.frozenAt >= layer.holdMs)
 			{
-				if (layer.blendMs > 0)
-				{
-					layer.fading = true;
-					layer.fadeAt = now;
-				}
-				else
-				{
-					AnimClip_Stop(layerIndex);
-					continue;
-				}
+				BeginFade(layer, now);
 			}
 
 			const auto progress = ClipProgress(layer);
@@ -1653,17 +1659,17 @@ namespace Components
 				const auto sinceStart = static_cast<float>(now - layer.startedAt);
 				if (sinceStart < layer.blendMs)
 					w *= sinceStart / static_cast<float>(layer.blendMs);
+			}
 
-				if (layer.fading)
+			if (layer.fading)
+			{
+				const auto out = 1.0f - static_cast<float>(now - layer.fadeAt) / static_cast<float>(std::max(layer.fadeMs, 1));
+				if (out <= 0.0f)
 				{
-					const auto out = 1.0f - static_cast<float>(now - layer.fadeAt) / static_cast<float>(layer.blendMs);
-					if (out <= 0.0f)
-					{
-						AnimClip_Stop(layerIndex);
-						continue;
-					}
-					w *= out;
+					AnimClip_Stop(layerIndex);
+					continue;
 				}
+				w *= out;
 			}
 
 			// tiny floor so a faded-to-zero layer still keeps its slot in the tree
