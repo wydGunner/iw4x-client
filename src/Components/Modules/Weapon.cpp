@@ -1415,7 +1415,7 @@ namespace Components
 		layer.outRate = 0.0f;
 		layer.pendingStart = true;
 		layer.startedAt = Game::Sys_Milliseconds();
-		layer.lastTick = layer.startedAt;
+		layer.lastTick = Game::CL_IsCgameInitialized() ? Game::cgArray[0].time : layer.startedAt;
 		layer.active = true;
 
 		if (ClipDebug())
@@ -1596,17 +1596,21 @@ namespace Components
 				// Standing still the game doesn't tick the viewmodel's anims, so
 				// the engine moves nothing and the clip froze (and the killcam
 				// got nothing). Then run it on our own clock from the anim's length.
-				const auto dt = static_cast<float>(now - layer.lastTick) / 1000.0f;
-				if (step <= 0.0f && dt > 0.0f)
+				// Game time (cg.time) so killcam slow motion slows the clip too.
+				// The engine can also tick only a little (two clips at once,
+				// standing still) - if it moved under half of what the anim's
+				// length says, use our own step.
+				const auto gameNow = Game::CL_IsCgameInitialized() ? Game::cgArray[0].time : now;
+				const auto dt = std::clamp(static_cast<float>(gameNow - layer.lastTick) / 1000.0f, 0.0f, 0.25f);
+				const auto freq = ClipAnimFrequency(ps, hand, anim);
+				if (freq > 0.0f && dt > 0.0f)
 				{
-					const auto freq = ClipAnimFrequency(ps, hand, anim);
-					if (freq > 0.0f)
-					{
-						const auto u = ClipProgress(layer);
-						step = std::clamp(dt * freq * layer.speed * ClipSpeedCurve(layer.speedCurve, u), 0.0f, 0.1f);
-					}
+					const auto u = ClipProgress(layer);
+					const auto expected = std::clamp(dt * freq * layer.speed * ClipSpeedCurve(layer.speedCurve, u), 0.0f, 0.1f);
+					if (step < expected * 0.5f)
+						step = expected;
 				}
-				layer.lastTick = now;
+				layer.lastTick = gameNow;
 
 				layer.pos += static_cast<float>(layer.dir) * step;
 
