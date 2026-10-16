@@ -1394,6 +1394,12 @@ namespace Components
 			return slot;
 		}
 
+		std::string& ClipReportPending()
+		{
+			static std::string pending;
+			return pending;
+		}
+
 		bool AnyClipActive()
 		{
 			for (const auto& layer : animClipLayers)
@@ -1812,14 +1818,32 @@ namespace Components
 			const auto* hello = Game::Dvar_FindVar("omen_hello_q");
 			if (!hello || hello->type != Game::DVAR_TYPE_STRING || !hello->current.string || !*hello->current.string) return;
 
-			std::string line = "omen_clip_rec";
+			// Clips started together (Play All: one per layer) go to the server
+			// as ONE command, "#" between them - sent one by one in the same
+			// frame, the server's flood protection dropped all but the first,
+			// so the killcam only had one of them.
+			std::string clip;
 			for (auto i = 0; i < params->size(); ++i)
 			{
-				line += ' ';
-				line += params->get(i);
+				if (i > 0) clip += ' ';
+				clip += params->get(i);
 			}
-			Game::CL_AddReliableCommand(0, line.data());
+			if (!ClipReportPending().empty()) ClipReportPending() += '#';
+			ClipReportPending() += clip;
 		};
+
+		// once a frame: send whatever clips were played this frame
+		Scheduler::Loop([]
+			{
+				auto& pending = ClipReportPending();
+				if (pending.empty()) return;
+				if (Game::CL_IsCgameInitialized())
+				{
+					const std::string line = "omen_clip_rec " + pending;
+					Game::CL_AddReliableCommand(0, line.data());
+				}
+				pending.clear();
+			}, Scheduler::Pipeline::CLIENT);
 
 		// server: keep it for the killcam (GSC: self waittill("omen_clip_rec", line))
 		ClientCommand::Add("omen_clip_rec", [](Game::gentity_s* ent, const Command::ServerParams* params)
