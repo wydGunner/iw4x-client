@@ -534,6 +534,16 @@ namespace Components
         Game::SV_GameSendServerCommand(-1, Game::SV_CMD_CAN_IGNORE, Utils::String::Format("{:c} \"Console: {}\"", 0x68, message));
         Logger::Print("Console: {}\n", message);
       }
+
+      // OMEN: hand server console chat to the scripts too, so chat commands
+      // (!checkstate, !vip ...) work from the console. Players' chat reaches
+      // scripts as level "say"; console chat has no player, so it gets its
+      // own notify:  level waittill("console_say", text);
+      if (!Game::level->initializing)
+      {
+        Game::Scr_AddString(message.data());
+        Game::Scr_NotifyLevel(static_cast<std::uint16_t>(Game::SL_GetString("console_say", 0)), 1);
+      }
     });
 
     Command::AddSV("tell", [](const Command::Params* params)
