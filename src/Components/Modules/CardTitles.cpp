@@ -20,6 +20,17 @@ namespace Components
     if (std::strcmp(data->name, username) == 0)
     {
       result += 0xFE000000;
+
+      // OMEN: your own card always shows your real rank. Right after a lobby
+      // switch the lobby copy of your card still holds placeholder rank data
+      // (prestige 0) until the party catches up, which made the rank icon
+      // flash. Fill it from your stats instead.
+      const auto xp = Game::Live_GetXp(0);
+      if (xp > 0)
+      {
+        data->rank = Game::CL_GetRankForXP(xp);
+        data->prestige = Game::Live_GetPrestige(0);
+      }
     }
     else
     {
