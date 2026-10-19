@@ -1278,6 +1278,7 @@ namespace Components
 		const Game::dvar_t* animClipKeepAds = nullptr;
 		const Game::dvar_t* animClipMixGame = nullptr;
 		const Game::dvar_t* animClipKnifeCancel = nullptr;
+		const Game::dvar_t* animClipSwapCancel = nullptr;
 		const Game::dvar_t* animClipDebug = nullptr;
 
 		bool ClipDebug()
@@ -1297,6 +1298,14 @@ namespace Components
 			if (!ps) return false;
 			const auto st = ps->weapState[Game::WEAPON_HAND_RIGHT].weaponState;
 			return st >= Game::WEAPON_MELEE_INIT && st <= Game::WEAPON_OFFHAND_END;
+		}
+
+		// starting to put the gun away - a weapon swap (Y / YY)
+		bool Swapping(const Game::playerState_s* ps)
+		{
+			if (!ps) return false;
+			const auto st = ps->weapState[Game::WEAPON_HAND_RIGHT].weaponState;
+			return st == Game::WEAPON_DROPPING || st == Game::WEAPON_DROPPING_QUICK || st == Game::WEAPON_DROPPING_ALT;
 		}
 
 		std::uint8_t* GetViewmodelHand(const int hand)
@@ -1520,6 +1529,16 @@ namespace Components
 		{
 			if (ClipDebug())
 				Logger::Print("animclip dbg {}: knife/throw cancel (game state {}, anim {})\n", now, ps->weapState[Game::WEAPON_HAND_RIGHT].weaponState, ps->weapState[Game::WEAPON_HAND_RIGHT].weapAnim);
+			AnimClip_Stop(-1);
+			return;
+		}
+
+		// Swapping weapons (Y / YY) cuts every clip too - its own toggle,
+		// animclip_swapcancel, since some clips swap on purpose (2026-10-19)
+		if (hand == 0 && animClipSwapCancel && animClipSwapCancel->current.enabled && Swapping(ps))
+		{
+			if (ClipDebug())
+				Logger::Print("animclip dbg {}: swap cancel (game state {})\n", now, ps->weapState[Game::WEAPON_HAND_RIGHT].weaponState);
 			AnimClip_Stop(-1);
 			return;
 		}
@@ -1851,6 +1870,8 @@ namespace Components
 			"Anim Clip: log every clip start / end / cancel to the console");
 		animClipKnifeCancel = Game::Dvar_RegisterBool("animclip_knifecancel", true, Game::DVAR_ARCHIVE,
 			"Knifing or throwing (throwing knife, grenade) stops every anim clip so the real move shows");
+		animClipSwapCancel = Game::Dvar_RegisterBool("animclip_swapcancel", true, Game::DVAR_ARCHIVE,
+			"Swapping weapons (Y / YY) stops every anim clip");
 		animClipMixGame = Game::Dvar_RegisterBool("animclip_mixgame", false, Game::DVAR_ARCHIVE,
 			"Anim clips blend with the game's own viewmodel anims (fire, reload...) instead of hiding them");
 
