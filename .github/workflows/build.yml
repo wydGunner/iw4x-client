@@ -5,6 +5,7 @@ on:
     branches:
       - "main"
       - "omen-r5167"
+      - "omen-r5278"
   pull_request:
 
 concurrency:
