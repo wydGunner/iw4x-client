@@ -805,8 +805,21 @@ namespace Components
 			return static_cast<unsigned int>((field->iOffset - FULLDEF_XANIMS) / 4);
 		}
 
+		// Enum fields stored as a plain int that can be edited live by number
+		// (OMEN Silent Shot Frag: offhandClass 4 = Throwing Knife).
+		bool IsIntEnumField(const Game::cspField_t* field)
+		{
+			return field->szName && !_stricmp(field->szName, "offhandClass")
+				&& field->iOffset >= 0 && field->iOffset < FULLDEF_WEAPDEF_END;
+		}
+
 		bool IsNumericField(const Game::cspField_t* field)
 		{
+			if (IsIntEnumField(field))
+			{
+				return true;
+			}
+
 			switch (field->iFieldType)
 			{
 			case CSPFT_INT:
