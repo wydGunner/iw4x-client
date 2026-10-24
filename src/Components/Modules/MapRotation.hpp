@@ -92,6 +92,7 @@ namespace Components
 
     static bool ShouldRotate();
     static void ApplyMap(const std::string& map);
+    static int SV_Map_DevmapCheck_Hk(const char* cmd, const char* devmap);
     static void ApplyGametype(const std::string& gametype);
     static void ApplyExec(const std::string& name);
     static void RestartCurrentMap();

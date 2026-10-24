@@ -243,14 +243,28 @@ namespace Components
   {
     assert(!map.empty());
 
-    if ((*Game::sv_cheats)->current.enabled)
+    // OMEN: always "map". The game's "devmap" is "killserver" + map - every
+    // player gets disconnected on each rotation. "map" keeps them connected,
+    // and with SV_Map_DevmapCheck_Hk below it keeps sv_cheats on when it's on.
+    Command::Execute(std::format("map {}", map), true);
+  }
+
+  // OMEN: SV_Map_f (0x6244B0, shared by "map" and "devmap") turns cheats on
+  // for the new map only when the command is "devmap" (I_stricmp at
+  // 0x6245B7) - plain "map" turns them off. With sv_cheats already on, treat
+  // "map" like "devmap" for that check, so the map changes without the
+  // server kill and cheats stay on. sv_cheats off: unchanged.
+  int MapRotation::SV_Map_DevmapCheck_Hk(const char* cmd, const char* devmap)
+  {
+    const auto result = Utils::Hook::Call<int(const char*, const char*)>(0x4DCF20)(cmd, devmap);
+    if (result == 0) return 0;
+
+    if (cmd && (*Game::sv_cheats)->current.enabled && !_stricmp(cmd, "map"))
     {
-      Command::Execute(std::format("devmap {}", map), true);
+      return 0;
     }
-    else
-    {
-      Command::Execute(std::format("map {}", map), true);
-    }
+
+    return result;
   }
 
   void MapRotation::ApplyGametype(const std::string& gametype)
@@ -409,6 +423,7 @@ namespace Components
   {
     Events::OnSVInit(AddMapRotationCommands);
     Utils::Hook::Set<void(*)()>(0x4152E8, SV_MapRotate_f);
+    Utils::Hook(0x6245B7, SV_Map_DevmapCheck_Hk, HOOK_CALL).install()->quick();
 
     DedicatedRotation.setHandler("map", ApplyMap);
     DedicatedRotation.setHandler("gametype", ApplyGametype);
