@@ -2123,12 +2123,13 @@ namespace Components
 		std::vector<unsigned int> localFakeLunge;
 		std::vector<unsigned int> localSlow;    // Slow Reload guns
 		bool localSohClass = false;             // this life's class has Sleight of Hand
-		bool localRiotProne = false;            // Riot Shield Prone is on for us
+		bool localRiotNoProne = false;          // Riot Shield Prone is OFF for us
 
-		// Per-player "Riot Shield Prone": this player can go prone (and stay
-		// prone) holding a riot shield. Set by GSC (SetRiotProne) on the
-		// server and by omen_riotprone on the player's own game.
-		bool riotProne[OVERRIDE_CLIENTS]{};
+		// Per-player "Riot Shield Prone" OFF: OMEN's riotshield has blocksProne 0
+		// (everyone can go prone with it); players who turn it off get the stock
+		// rule back (no prone with the shield out). Set by GSC (SetRiotNoProne)
+		// on the server and by omen_riotnoprone on the player's own game.
+		bool riotNoProne[OVERRIDE_CLIENTS]{};
 		thread_local int riotPmClient = -1;     // whose Pmove is running right now
 
 		void ClearLocalMods()
@@ -2137,7 +2138,7 @@ namespace Components
 			localFakeLunge.clear();
 			localSlow.clear();
 			localSohClass = false;
-			localRiotProne = false;
+			localRiotNoProne = false;
 		}
 
 		bool LocalPredict(const int clientNum)
@@ -2282,7 +2283,7 @@ namespace Components
 					fakeLungeWeapons[clientNum].clear();
 					fakeLungeActive[clientNum] = false;
 					serverSoh[clientNum] = false;
-					riotProne[clientNum] = false;
+					riotNoProne[clientNum] = false;
 				}
 			});
 
@@ -2294,7 +2295,7 @@ namespace Components
 				for (auto& list : fakeLungeWeapons) list.clear();
 				for (auto& active : fakeLungeActive) active = false;
 				for (auto& soh : serverSoh) soh = false;
-				for (auto& rp : riotProne) rp = false;
+				for (auto& rp : riotNoProne) rp = false;
 			});
 
 		// self WeapDefSetFor(<weapon>, <field>, <value>)   - only this player
@@ -2691,9 +2692,9 @@ namespace Components
 				localSohClass = params->size() < 2 || std::atoi(params->get(1)) != 0;
 			});
 
-		Command::Add("omen_riotprone", [](const Command::Params* params)
+		Command::Add("omen_riotnoprone", [](const Command::Params* params)
 			{
-				localRiotProne = params->size() < 2 || std::atoi(params->get(1)) != 0;
+				localRiotNoProne = params->size() < 2 || std::atoi(params->get(1)) != 0;
 			});
 
 		Command::Add("omen_localmods_clear", []
@@ -2708,26 +2709,28 @@ namespace Components
 	}
 
 	// =====================================================================
-	// Per-player "Riot Shield Prone"
+	// Per-player "Riot Shield Prone" (OMEN)
 	// ---------------------------------------------------------------------
-	// The game asks two questions about blocksProne (only the riot shield
-	// has it):
+	// OMEN's riotshield_mp has blocksProne 0, so everyone can go prone with
+	// it. A player who turns Riot Shield Prone OFF gets the stock rule back,
+	// only for them. The game asks two questions about blocksProne:
 	//   0x44BF40  BG_WeaponBlocksProne(weapon)       - movement: stand the
 	//             player up / refuse prone (called inside Pmove), and the
 	//             stance icon on the HUD
 	//   0x4CA460  can this ps switch to <weapon>?    - "not while prone"
-	// Both are replaced so the answer is "doesn't block" for players with
-	// it on. Inside Pmove the player is whoever's Pmove is running; outside
-	// it (HUD / weapon select on a player's own game) it's the local player.
+	// Both are replaced: a riot shield (weapType) blocks prone for players
+	// with it off; everything else works like the game does. Inside Pmove
+	// the player is whoever's Pmove is running; outside it (HUD / weapon
+	// select on a player's own game) it's the local player.
 	//
-	// GSC:  self SetRiotProne(<on 0/1>)
-	// Own game (dll players): omen_riotprone <0/1>  so prediction matches.
+	// GSC:  self SetRiotNoProne(<1 = no prone, 0 = prone allowed>)
+	// Own game (dll players): omen_riotnoprone <0/1>  so prediction matches.
 	// =====================================================================
-	bool Weapon::RiotProne_For(const int clientNum)
+	bool Weapon::RiotNoProne_For(const int clientNum)
 	{
 		if (!ValidClient(clientNum)) return false;
-		if (riotProne[clientNum]) return true;
-		return localRiotProne && LocalPredict(clientNum);
+		if (riotNoProne[clientNum]) return true;
+		return localRiotNoProne && LocalPredict(clientNum);
 	}
 
 	void Weapon::RiotProne_SetPmClient(const int clientNum)
@@ -2735,26 +2738,32 @@ namespace Components
 		riotPmClient = clientNum;
 	}
 
+	namespace
+	{
+		bool WeaponBlocksProneFor(const Game::WeaponDef* weapDef, const bool noProne)
+		{
+			if (!weapDef) return false;
+			if (weapDef->blocksProne) return true;
+			return noProne && weapDef->weapType == Game::WEAPTYPE_RIOTSHIELD;
+		}
+	}
+
 	bool Weapon::BG_WeaponBlocksProne_Hk(const unsigned int weapIndex)
 	{
-		const auto* weapDef = Game::BG_GetWeaponDef(weapIndex);
-		if (!weapDef || !weapDef->blocksProne) return false;
-
 		auto clientNum = riotPmClient;
 		if (clientNum < 0 && Game::CL_IsCgameInitialized())
 		{
 			clientNum = Game::cgArray[0].clientNum;
 		}
 
-		return !RiotProne_For(clientNum);
+		return WeaponBlocksProneFor(Game::BG_GetWeaponDef(weapIndex), RiotNoProne_For(clientNum));
 	}
 
 	bool Weapon::BG_CanSwitchWhileProne_Hk(Game::playerState_s* ps, const unsigned int weapIndex)
 	{
-		const auto* weapDef = Game::BG_GetWeaponDef(weapIndex);
-		if (!ps || !weapDef || !weapDef->blocksProne) return true;
+		if (!ps) return true;
 		if ((ps->pm_flags & Game::PMF_PRONE) == 0) return true;
-		return RiotProne_For(ps->clientNum);
+		return !WeaponBlocksProneFor(Game::BG_GetWeaponDef(weapIndex), RiotNoProne_For(ps->clientNum));
 	}
 
 	void Weapon::AddRiotProne()
@@ -2762,12 +2771,12 @@ namespace Components
 		Utils::Hook(0x44BF40, BG_WeaponBlocksProne_Hk, HOOK_JUMP).install()->quick();
 		Utils::Hook(0x4CA460, BG_CanSwitchWhileProne_Hk, HOOK_JUMP).install()->quick();
 
-		// self SetRiotProne(<on 0/1>)   - only this player
-		GSC::Script::AddMethod("SetRiotProne", [](const Game::scr_entref_t entref)
+		// self SetRiotNoProne(<1 = no prone with the shield, 0 = allowed>)   - only this player
+		GSC::Script::AddMethod("SetRiotNoProne", [](const Game::scr_entref_t entref)
 			{
 				const auto clientNum = GetPlayerArg(entref);
 				if (!ValidClient(clientNum)) return;
-				riotProne[clientNum] = Game::Scr_GetNumParam() < 1 || Game::Scr_GetInt(0) != 0;
+				riotNoProne[clientNum] = Game::Scr_GetNumParam() < 1 || Game::Scr_GetInt(0) != 0;
 			});
 	}
 

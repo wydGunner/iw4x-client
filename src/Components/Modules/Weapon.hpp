@@ -81,7 +81,7 @@ namespace Components
 		static void AddLocalModCommands();
 
 		// Per-player Riot Shield Prone (OMEN)
-		static bool RiotProne_For(int clientNum);
+		static bool RiotNoProne_For(int clientNum);
 		static void RiotProne_SetPmClient(int clientNum);
 		static bool BG_WeaponBlocksProne_Hk(unsigned int weapIndex);
 		static bool BG_CanSwitchWhileProne_Hk(Game::playerState_s* ps, unsigned int weapIndex);
