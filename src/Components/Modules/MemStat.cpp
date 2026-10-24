@@ -14,7 +14,7 @@ namespace Components
   // share that pool.
   //
   // This only READS the pool and prints what's in it:
-  //   - every map start and map end: one line, how full it is
+  //   - every map end (scripts shutting down): one line, how full it is
   //   - omen_memstat (console): the full report
   //   - right before that error: the full report, so the log shows what
   //     filled it
@@ -237,14 +237,14 @@ namespace Components
       Report("now", true);
     });
 
-    Events::OnSVInit([]
-    {
-      Report(std::format("map start {}", (*Game::sv_mapname)->current.string).data(), false);
-    });
-
+    // (no report at "SV init": that runs once while the game is still
+    // starting up - the map name doesn't exist yet and reading it stopped
+    // the game from launching)
     Events::OnVMShutdown([]
     {
-      Report("map end", false);
+      const auto* mapname = Game::sv_mapname ? *Game::sv_mapname : nullptr;
+      const auto* name = (mapname && mapname->current.string) ? mapname->current.string : "?";
+      Report(std::format("map end ({})", name).data(), false);
     });
   }
 }
