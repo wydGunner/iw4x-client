@@ -1,6 +1,7 @@
 #include "PlayerMovement.hpp"
 #include "Events.hpp"
 #include "GSC/Script.hpp"
+#include "Weapon.hpp"
 
 constexpr int MASK_PLAYER_CLIP = 0x10000;
 constexpr int MASK_BARRIER_CLIP = 0x400;
@@ -292,7 +293,10 @@ namespace Components
       }
     }
 
+    // OMEN Riot Shield Prone: tell the blocksProne check whose move this is
+    Weapon::RiotProne_SetPmClient((pm && pm->ps) ? pm->ps->clientNum : -1);
     Game::PMoveSingle(pm);
+    Weapon::RiotProne_SetPmClient(-1);
   }
 
 

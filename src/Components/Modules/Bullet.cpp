@@ -95,6 +95,39 @@ namespace Components
     std::memcpy(CalcRicochetSave, result, sizeof(float[3]));
   }
 
+  // OMEN: the real bullet path, for scripts (Almost Hits).
+  // Bullet_Fire (0x4402C0) works out each bullet's end point - spread
+  // included - with Bullet_Endpos (0x4D1A50) right before tracing it. We let
+  // it do that, then tell the shooter's script where the bullet went:
+  //   self waittill("omen_bullet", sx, sy, sz, ex, ey, ez);
+  // start = muzzle, end = max range along the real (spread) direction.
+  // Shotguns send one per pellet. Server only (Bullet_Fire is server code).
+  // `end` and `dir` point into Bullet_Fire's BulletFireParams:
+  //   +0x04 ignoreEntIndex (= the shooter for players)  +0x1C start  +0x28 end
+  void Bullet::Bullet_Endpos_Hk(int* randSeed, float spread, float* end, float* dir, Game::weaponParms* wp, float maxRange)
+  {
+    Utils::Hook::Call<void(int*, float, float*, float*, Game::weaponParms*, float)>(0x4D1A50)(randSeed, spread, end, dir, wp, maxRange);
+
+    if (!end || !Game::level || Game::level->initializing) return;
+
+    auto* bp = reinterpret_cast<std::uint8_t*>(end) - 0x28;
+    const auto shooter = *reinterpret_cast<int*>(bp + 0x04);
+    if (shooter < 0 || shooter >= static_cast<int>(Game::MAX_CLIENTS)) return;
+
+    auto* ent = &Game::g_entities[shooter];
+    if (!ent->client) return;
+
+    const auto* start = reinterpret_cast<float*>(bp + 0x1C);
+
+    Game::Scr_AddFloat(end[2]);
+    Game::Scr_AddFloat(end[1]);
+    Game::Scr_AddFloat(end[0]);
+    Game::Scr_AddFloat(start[2]);
+    Game::Scr_AddFloat(start[1]);
+    Game::Scr_AddFloat(start[0]);
+    Game::Scr_Notify(ent, static_cast<std::uint16_t>(Game::SL_GetString("omen_bullet", 0)), 6);
+  }
+
   int Bullet::Bullet_Fire_Stub(Game::gentity_s* attacker, [[maybe_unused]] float spread, Game::weaponParms* wp, Game::gentity_s* weaponEnt, Game::PlayerHandIndex hand, int gameTime)
   {
     float tmp[3];
@@ -123,6 +156,9 @@ namespace Components
     Utils::Hook(0x440340, Bullet_FireStub, HOOK_JUMP).install()->quick();
 
     Utils::Hook(0x440368, BG_srand_Hk, HOOK_CALL).install()->quick();
+
+    // OMEN: real bullet path -> script (Almost Hits)
+    Utils::Hook(0x44042C, Bullet_Endpos_Hk, HOOK_CALL).install()->quick();
 
     std::memset(ContactPointSave, 0, sizeof(float[3]));
     std::memset(VCSave, 0, sizeof(float[3]));

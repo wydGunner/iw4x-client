@@ -26,6 +26,8 @@ namespace Components
 
     static void BG_srand_Hk(unsigned int* pHoldrand);
 
+    static void Bullet_Endpos_Hk(int* randSeed, float spread, float* end, float* dir, Game::weaponParms* wp, float maxRange);
+
     static void BulletRicochet_Save(const float* contactPoint);
     static void BulletRicochet_Stub();
 

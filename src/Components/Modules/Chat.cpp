@@ -546,6 +546,46 @@ namespace Components
       }
     });
 
+    // OMEN: chat commands typed straight into the server console, no "say"
+    // in front:  !admin gunner  /  admin gunner  /  !checkstate  ...
+    // Same as "say !admin gunner" for the scripts (level "console_say"),
+    // but nothing is sent to the players' chat.
+    // (the game keeps the name pointers, so they're string literals)
+    static const char* consoleChatCmds[][2] =
+    {
+      { "checkstate", "!checkstate" }, { "reloadroles", "!reloadroles" },
+      { "verify", "!verify" }, { "verified", "!verified" }, { "vip", "!vip" },
+      { "admin", "!admin" }, { "unrole", "!unrole" }, { "longshot", "!longshot" },
+    };
+
+    for (const auto& names : consoleChatCmds)
+    {
+      const std::string bare = names[0];
+      const auto handler = [bare](const Command::Params* params)
+      {
+        if (!Dedicated::IsRunning())
+        {
+          Logger::Print("Server is not running.\n");
+          return;
+        }
+
+        if (Game::level->initializing) return;
+
+        auto text = "!" + bare;
+        if (params->size() > 1)
+        {
+          text += " " + params->join(1);
+        }
+
+        Logger::Print("Console command: {}\n", text);
+        Game::Scr_AddString(text.data());
+        Game::Scr_NotifyLevel(static_cast<std::uint16_t>(Game::SL_GetString("console_say", 0)), 1);
+      };
+
+      Command::AddSV(names[0], handler);
+      Command::AddSV(names[1], handler);
+    }
+
     Command::AddSV("tell", [](const Command::Params* params)
     {
       if (!Dedicated::IsRunning())

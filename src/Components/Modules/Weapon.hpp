@@ -80,6 +80,13 @@ namespace Components
 		static void AddServerSoh();
 		static void AddLocalModCommands();
 
+		// Per-player Riot Shield Prone (OMEN)
+		static bool RiotProne_For(int clientNum);
+		static void RiotProne_SetPmClient(int clientNum);
+		static bool BG_WeaponBlocksProne_Hk(unsigned int weapIndex);
+		static bool BG_CanSwitchWhileProne_Hk(Game::playerState_s* ps, unsigned int weapIndex);
+		static void AddRiotProne();
+
 		// Viewmodel anim clip player
 		static void AnimClip_Play(int layerIndex, unsigned int anim, float startPct, float endPct, float speed, bool freezeAtEnd, float weight,
 			int mode = 0, int speedCurve = 0, int weightCurve = 0, int holdMs = 0, int blendMs = 0, int hands = 0);
