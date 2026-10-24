@@ -8,6 +8,7 @@
 #include "Modules/Bots.hpp"
 #include "Modules/Branding.hpp"
 #include "Modules/Bullet.hpp"
+#include "Modules/MemStat.hpp"
 #include "Modules/CardTitles.hpp"
 #include "Modules/Ceg.hpp"
 #include "Modules/Changelog.hpp"
@@ -120,6 +121,7 @@ namespace Components
     Register(new Bots());
     Register(new Branding());
     Register(new Bullet());
+    Register(new MemStat());
     Register(new CardTitles());
     Register(new Ceg());
     Register(new Changelog());
