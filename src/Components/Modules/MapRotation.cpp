@@ -243,10 +243,20 @@ namespace Components
   {
     assert(!map.empty());
 
-    // OMEN: always "map". The game's "devmap" is "killserver" + map - every
-    // player gets disconnected on each rotation. "map" keeps them connected,
-    // and with SV_Map_DevmapCheck_Hk below it keeps sv_cheats on when it's on.
-    Command::Execute(std::format("map {}", map), true);
+    // OMEN: on a dedicated server always "map". The game's "devmap" is
+    // "killserver" + map - every player gets disconnected on each rotation.
+    // "map" keeps them connected, and with SV_Map_DevmapCheck_Hk below it
+    // keeps sv_cheats on when it's on.
+    // Your own game (private match host): unchanged - there "map" instead of
+    // devmap backed the host out to the main menu.
+    if (Dedicated::IsEnabled() || !(*Game::sv_cheats)->current.enabled)
+    {
+      Command::Execute(std::format("map {}", map), true);
+    }
+    else
+    {
+      Command::Execute(std::format("devmap {}", map), true);
+    }
   }
 
   // OMEN: SV_Map_f (0x6244B0, shared by "map" and "devmap") turns cheats on
@@ -259,7 +269,7 @@ namespace Components
     const auto result = Utils::Hook::Call<int(const char*, const char*)>(0x4DCF20)(cmd, devmap);
     if (result == 0) return 0;
 
-    if (cmd && (*Game::sv_cheats)->current.enabled && !_stricmp(cmd, "map"))
+    if (cmd && Dedicated::IsEnabled() && (*Game::sv_cheats)->current.enabled && !_stricmp(cmd, "map"))
     {
       return 0;
     }
