@@ -1,6 +1,7 @@
 #include "ViewModelEditor.hpp"
 #include "Events.hpp"
 #include "GSC/Script.hpp"
+#include "Weapon.hpp"
 
 namespace Components
 {
@@ -133,6 +134,9 @@ namespace Components
       Game::XModel* hands = nullptr;
       unsigned int playing = 0; // anim we set a weight on
       bool drawn = false;       // drawn this frame (hide the arm on the real one)
+      bool clip = false;        // Anim Clip drives it (Hand: Left Arm / Right Arm + Gun)
+      int builtArm = -1;        // which arm the copy shows
+      std::string why;          // last reason it isn't drawn (console)
       unsigned int realBits[6]{}; // bits we set on the real view model
     } handAnim;
 
@@ -152,6 +156,7 @@ namespace Components
       handAnim.hands = nullptr;
       handAnim.playing = 0;
       handAnim.drawn = false;
+      handAnim.builtArm = -1;
     }
 
     void HandAnimDestroy()
@@ -212,20 +217,34 @@ namespace Components
       return *reinterpret_cast<void**>(base + weapon * 3 * sizeof(std::uintptr_t));
     }
 
+    bool NotReady(const char* reason)
+    {
+      if (handAnim.why != reason)
+      {
+        handAnim.why = reason;
+        Logger::Print("vm_handanim: not drawn - {}\n", reason);
+      }
+      return false;
+    }
+
     // build / keep the copy for the gun you're holding; false = don't draw it
     bool HandAnimReady()
     {
-      if (!handAnim.active || !InGame()) return false;
+      handAnim.clip = Weapon::AnimClip_SplitActive();
+      if ((!handAnim.active && !handAnim.clip) || !InGame()) return false;
+      const auto arm = handAnim.clip ? 0 : handAnim.arm; // Anim Clip: the copy is always the left arm
 
       // akimbo: that slot is the left gun's
-      if (*reinterpret_cast<Game::DObj**>(VIEWMODEL_HANDS + VIEWMODEL_HAND_SIZE)) { HandAnimDrop(); return false; }
+      if (*reinterpret_cast<Game::DObj**>(VIEWMODEL_HANDS + VIEWMODEL_HAND_SIZE)) { HandAnimDrop(); return NotReady("akimbo gun"); }
 
       const auto weapon = CurrentWeapon();
       auto* hands = weapon ? *reinterpret_cast<Game::XModel**>(WEAPON_VIEWMODEL_CACHE + weapon * 0x20) : nullptr;
       auto* anims = weapon ? WeaponAnims(weapon) : nullptr;
-      if (!hands || !anims) return false;
+      if (!weapon) return NotReady("no weapon");
+      if (!hands) return NotReady("no hands model for this gun");
+      if (!anims) return NotReady("no anims for this gun");
 
-      if (handAnim.obj && (!HandAnimObjAlive() || handAnim.weapon != weapon || handAnim.hands != hands))
+      if (handAnim.obj && (!HandAnimObjAlive() || handAnim.weapon != weapon || handAnim.hands != hands || handAnim.builtArm != arm))
       {
         HandAnimDestroy();
       }
@@ -233,14 +252,14 @@ namespace Components
       if (!handAnim.obj)
       {
         handAnim.tree = XAnimCreateSmallTree(anims);
-        if (!handAnim.tree) return false;
+        if (!handAnim.tree) return NotReady("couldn't make an anim tree");
         DObjModel model{ hands, 0, true };
         handAnim.obj = ClientDObjCreate(&model, 1, handAnim.tree, HANDANIM_HANDLE, 0);
         if (!handAnim.obj)
         {
           XAnimFreeTree(handAnim.tree);
           HandAnimDrop();
-          return false;
+          return NotReady("couldn't make the arm copy");
         }
         handAnim.weapon = weapon;
         handAnim.hands = hands;
@@ -248,12 +267,25 @@ namespace Components
         // root blend node on, like the game does for the view model
         XAnimSetGoalWeight(handAnim.obj, 0, 1.0f, 0.0f, 1.0f, 0, 1, 0);
         // the copy only shows the picked arm
-        SetArmBits(handAnim.obj, hands, handAnim.arm == 0 ? 1 : 0, nullptr);
+        SetArmBits(handAnim.obj, hands, arm == 0 ? 1 : 0, nullptr);
+        handAnim.builtArm = arm;
+        auto shown = 0;
+        for (auto b = 0; b < hands->numBones; ++b)
+        {
+          if (ArmBone(Game::SL_ConvertToString(static_cast<Game::scr_string_t>(hands->boneNames[b])), arm)) ++shown;
+        }
+        Logger::Print("vm_handanim: arm copy made for {} ({} bones, {} in the {} arm)\n", hands->name ? hands->name : "?", hands->numBones, shown, arm == 0 ? "left" : "right");
+      }
+
+      if (handAnim.clip)
+      {
+        handAnim.why.clear();
+        return true; // Anim Clip (Weapon.cpp) drives the copy's anims
       }
 
       if (handAnim.anim >= *static_cast<unsigned int*>(anims) || AnimFrequency(anims, handAnim.anim) <= 0.0f)
       {
-        return false; // this gun has no such anim
+        return NotReady("this gun doesn't have that anim");
       }
 
       if (handAnim.playing != handAnim.anim)
@@ -270,6 +302,7 @@ namespace Components
       handAnim.time += dt * 0.001f * AnimFrequency(anims, handAnim.anim) * handAnim.speed;
       handAnim.time -= std::floor(handAnim.time);
       XAnimSetTime(handAnim.tree, handAnim.anim, std::min(handAnim.time, 0.999f));
+      handAnim.why.clear();
       return true;
     }
 
@@ -283,7 +316,7 @@ namespace Components
         handAnim.drawn = HandAnimReady();
         if (handAnim.drawn)
         {
-          SetArmBits(obj, handAnim.hands, handAnim.arm, handAnim.realBits);
+          SetArmBits(obj, handAnim.hands, handAnim.builtArm, handAnim.realBits);
         }
       }
 
@@ -400,6 +433,11 @@ namespace Components
     {
       return (mat && mat->info.name) ? mat->info.name : "";
     }
+  }
+
+  Game::DObj* ViewModelEditor::SplitCopy()
+  {
+    return (handAnim.clip && HandAnimObjAlive()) ? handAnim.obj : nullptr;
   }
 
   void ViewModelEditor::RestoreAll()
@@ -664,6 +702,8 @@ namespace Components
       handAnim.time = 0.0f;
       handAnim.lastMs = 0;
       handAnim.active = true;
+      handAnim.why.clear();
+      Logger::Print("vm_handanim: {} arm plays anim {} x{}\n", arm == 0 ? "left" : "right", anim, handAnim.speed);
     });
 
     Command::Add("vm_reset", []

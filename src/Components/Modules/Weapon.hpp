@@ -19,6 +19,10 @@ namespace Components
 		// OMEN Riot Shield Prone: whose Pmove is running (PlayerMovement::PmoveSingle_Stub)
 		static void RiotProne_SetPmClient(int clientNum);
 
+		// OMEN Anim Clip: a layer set to Left Arm / Right Arm + Gun is playing
+		// (ViewModelEditor then draws the left-arm copy)
+		static bool AnimClip_SplitActive();
+
 	private:
 		static const Game::dvar_t* BGWeaponOffHandFix;
 		static const Game::dvar_t* CGRecoilMultiplier;
