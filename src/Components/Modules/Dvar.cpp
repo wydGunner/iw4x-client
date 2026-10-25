@@ -346,6 +346,22 @@ namespace Components
     }
 
     Utils::Hook::Call<void(const char*, const char*)>(0x4F52E0)(dvarName, value);
+
+    for (const auto& callback : ServerSetCallbacks())
+    {
+      callback(dvarName, value);
+    }
+  }
+
+  std::vector<std::function<void(const char*, const char*)>>& Dvar::ServerSetCallbacks()
+  {
+    static std::vector<std::function<void(const char*, const char*)>> callbacks;
+    return callbacks;
+  }
+
+  void Dvar::OnServerSet(const std::function<void(const char* dvarName, const char* value)>& callback)
+  {
+    ServerSetCallbacks().push_back(callback);
   }
 
   void Dvar::OnRegisterVariant([[maybe_unused]] Game::dvar_t* dvar)

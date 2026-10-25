@@ -2547,26 +2547,17 @@ namespace Components
 		// (team score / timer bottom left) blink every time. Same commands,
 		// same rights as the helper menu; also puts the default menu keys
 		// on unless the player set their own in OMEN SETUP.
-		Scheduler::Loop([]
+		// Run as each value ARRIVES (Dvar::OnServerSet), not by checking the
+		// dvar once a frame: two values that land in the same frame (joining:
+		// the held commands all go out together) used to lose the first one -
+		// "exec omen_binds.cfg" - and CFG scripts needed Reload after joining.
+		// The once-a-frame check stays as a backup; both skip what already ran.
+		// (2026-10-25)
+		static std::string cexecLast;
+		static const auto runCexec = [](const std::string& value)
 			{
-				static std::string last;
-				static bool primed = false;
-				if (!Game::CL_IsCgameInitialized())
-				{
-					primed = false;
-					return;
-				}
-				const auto* dvar = Game::Dvar_FindVar("omen_cexec_q");
-				if (!dvar || dvar->type != Game::DVAR_TYPE_STRING || !dvar->current.string) return;
-				const std::string value = dvar->current.string;
-				if (!primed)
-				{
-					last = value;   // left over from an earlier game - not new
-					primed = true;
-					return;
-				}
-				if (value.empty() || value == last) return;
-				last = value;
+				if (value.empty() || value == cexecLast) return;
+				cexecLast = value;
 
 				const auto bar = value.find('|');
 				if (bar == std::string::npos) return;
@@ -2580,6 +2571,33 @@ namespace Components
 				{
 					Command::Execute("bind UPARROW +omen_up;bind DOWNARROW +omen_down;bind LEFTARROW +omen_left;bind RIGHTARROW +omen_right;bind ENTER +omen_select;bind KP_ENTER +omen_select", false);
 				}
+			};
+
+		Dvar::OnServerSet([](const char* dvarName, const char* value)
+			{
+				if (dvarName && value && !_stricmp(dvarName, "omen_cexec_q")) runCexec(value);
+			});
+
+		Scheduler::Loop([]
+			{
+				static bool primed = false;
+				if (!Game::CL_IsCgameInitialized())
+				{
+					primed = false;
+					return;
+				}
+				const auto* dvar = Game::Dvar_FindVar("omen_cexec_q");
+				if (!dvar || dvar->type != Game::DVAR_TYPE_STRING || !dvar->current.string) return;
+				const std::string value = dvar->current.string;
+				if (!primed)
+				{
+					// left over from an earlier game - not new (anything the
+					// server sent this game already ran through OnServerSet)
+					if (value != cexecLast) cexecLast = value;
+					primed = true;
+					return;
+				}
+				runCexec(value);
 			}, Scheduler::Pipeline::CLIENT);
 
 		// Double-duty keys (OMEN SETUP > Double-Duty Keys). A key bound to
