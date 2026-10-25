@@ -16,7 +16,9 @@ namespace Components
   //   vm_hide <part> / vm_unhide <part>   hide a part (and what hangs on it)
   //   vm_hide_reset                       show every part again
   //   vm_skins [text]                     skins (materials) you can use
-  //   vm_skin <material> / vm_skin reset  paint the gun you're holding
+  //   vm_skin <material> [where]          paint the gun you're holding
+  //       where: gun (default) / arms / a part (bone) of the gun or arms
+  //   vm_skin reset                       gun + arms back
   //   vm_reset                            everything back
   //
   // Engine (iw4x.exe, found by disassembly):
@@ -164,6 +166,87 @@ namespace Components
     const char* MaterialName(const Game::Material* mat)
     {
       return (mat && mat->info.name) ? mat->info.name : "";
+    }
+
+    // the arms model of the view model you're holding (DObj model 0)
+    Game::XModel* HandsModel()
+    {
+      auto* obj = HandDObj(0);
+      return (obj && obj->models && obj->numModels > 0) ? obj->models[0] : nullptr;
+    }
+
+    int BoneIndexOf(const Game::XModel* model, const std::string& name)
+    {
+      if (!model || !model->boneNames) return -1;
+      for (auto b = 0; b < model->numBones; ++b)
+      {
+        const auto* n = Game::SL_ConvertToString(static_cast<Game::scr_string_t>(model->boneNames[b]));
+        if (n && Utils::String::ToLower(n) == name) return b;
+      }
+      return -1;
+    }
+
+    // bone b is root or hangs under it
+    bool InSubtree(const Game::XModel* model, int b, const int root)
+    {
+      for (auto guard = 0; b >= 0 && guard < 256; ++guard)
+      {
+        if (b == root) return true;
+        if (b < model->numRootBones) return false;
+        b -= model->parentList[b - model->numRootBones];
+      }
+      return false;
+    }
+
+    // Surfaces (material slots) of a model that make up one part: the ones
+    // that only use that part's bones; if none do, the ones that touch it.
+    // root < 0 = every surface.
+    std::vector<int> PartSurfaces(const Game::XModel* model, const int root)
+    {
+      std::vector<int> only, touch;
+      if (!model || !model->materialHandles) return only;
+      for (auto lod = 0; lod < 4 && lod < std::max<int>(model->numLods, 1); ++lod)
+      {
+        const auto& info = model->lodInfo[lod];
+        if (!info.surfs) continue;
+        for (auto i = 0; i < info.numsurfs; ++i)
+        {
+          const auto slot = info.surfIndex + i;
+          if (slot >= model->numsurfs) continue;
+          if (root < 0) { only.push_back(slot); continue; }
+          auto in = false, out = false;
+          for (auto b = 0; b < model->numBones && b < 192; ++b)
+          {
+            if (!(info.surfs[i].partBits[b >> 5] & (0x80000000u >> (b & 31)))) continue;
+            if (InSubtree(model, b, root)) in = true; else out = true;
+          }
+          if (in && !out) only.push_back(slot);
+          if (in) touch.push_back(slot);
+        }
+      }
+      if (root < 0 && only.empty())
+      {
+        for (auto slot = 0; slot < model->numsurfs; ++slot) only.push_back(slot);
+      }
+      return only.empty() ? touch : only;
+    }
+
+    void PaintSurfaces(Game::XModel* model, const std::vector<int>& slots, Game::Material* mat)
+    {
+      if (!model || !model->materialHandles || slots.empty()) return;
+      if (!savedSkins.contains(model))
+      {
+        savedSkins[model] = std::vector<Game::Material*>(model->materialHandles, model->materialHandles + model->numsurfs);
+      }
+      for (const auto slot : slots) model->materialHandles[slot] = mat;
+    }
+
+    void UnpaintModel(Game::XModel* model)
+    {
+      const auto it = savedSkins.find(model);
+      if (it == savedSkins.end() || !model || !model->materialHandles) return;
+      for (std::size_t i = 0; i < it->second.size() && i < model->numsurfs; ++i) model->materialHandles[i] = it->second[i];
+      savedSkins.erase(it);
     }
   }
 
@@ -364,17 +447,14 @@ namespace Components
     {
       if (params->size() < 2) return;
       const std::string name = params->get(1);
+      const std::string where = params->size() > 2 ? Utils::String::ToLower(params->get(2)) : "gun";
       const auto models = GunModels(CurrentWeapon());
+      auto* hands = HandsModel();
 
       if (name == "reset")
       {
-        for (auto* model : models)
-        {
-          const auto it = savedSkins.find(model);
-          if (it == savedSkins.end()) continue;
-          for (std::size_t i = 0; i < it->second.size() && i < model->numsurfs; ++i) model->materialHandles[i] = it->second[i];
-          savedSkins.erase(it);
-        }
+        for (auto* model : models) UnpaintModel(model);
+        UnpaintModel(hands);
         return;
       }
 
@@ -386,14 +466,38 @@ namespace Components
       auto* mat = Game::DB_FindXAssetHeader(Game::ASSET_TYPE_MATERIAL, name.data()).material;
       if (!mat) return;
 
+      if (where == "gun" || where == "whole" || where.empty())
+      {
+        for (auto* model : models) PaintSurfaces(model, PartSurfaces(model, -1), mat);
+        return;
+      }
+      if (where == "arms" || where == "hands")
+      {
+        PaintSurfaces(hands, PartSurfaces(hands, -1), mat);
+        return;
+      }
+
+      // one part: a bone of the gun (every camo version of it) or of the arms
+      auto painted = 0;
       for (auto* model : models)
       {
-        if (!savedSkins.contains(model))
-        {
-          savedSkins[model] = std::vector<Game::Material*>(model->materialHandles, model->materialHandles + model->numsurfs);
-        }
-        for (auto s = 0; s < model->numsurfs; ++s) model->materialHandles[s] = mat;
+        const auto bone = BoneIndexOf(model, where);
+        if (bone < 0) continue;
+        const auto slots = PartSurfaces(model, bone);
+        PaintSurfaces(model, slots, mat);
+        painted += static_cast<int>(slots.size());
       }
+      if (!painted && hands)
+      {
+        const auto bone = BoneIndexOf(hands, where);
+        if (bone >= 0)
+        {
+          const auto slots = PartSurfaces(hands, bone);
+          PaintSurfaces(hands, slots, mat);
+          painted = static_cast<int>(slots.size());
+        }
+      }
+      if (!painted) Logger::Print("vm_skin: nothing to paint on '{}' (vm_parts shows the parts)\n", where);
     });
 
     Command::Add("vm_reset", []
