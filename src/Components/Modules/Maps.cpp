@@ -538,6 +538,14 @@ namespace Components
 
     char hashBuf[100] = { 0 };
     unsigned int hash = atoi(Game::MSG_ReadStringLine(msg, hashBuf, sizeof(hashBuf)));
+    // OMEN: we ARE the server (private match / own box). Our own game never
+    // has to reconnect to itself - it has the map it's loading. Reconnecting
+    // here left the host on "Waiting for party leader" every time the map
+    // changed with "map" (menu Change Map, map vote, typed "map").
+    if (Game::SV_Loaded())
+    {
+      return false;
+    }
 
     // If the server rotated to a DLC map we don't have, then loading it
     // fails with a fatal error. So skip the map change, disconnect, and show
