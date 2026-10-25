@@ -12,10 +12,6 @@ namespace Components
     // skins back before a map change / disconnect (model pointers go away)
     static void RestoreAll();
 
-    // the left-arm copy while an Anim Clip layer is on Left Arm / Right Arm + Gun
-    // (Weapon.cpp plays the clip on it), else nullptr
-    static Game::DObj* SplitCopy();
-
   private:
     static void CalcWeaponPosition_Stub();
     static void AfterWeaponPosition(float* placement);

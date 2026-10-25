@@ -1,7 +1,6 @@
 #include "ViewModelEditor.hpp"
 #include "Events.hpp"
 #include "GSC/Script.hpp"
-#include "Weapon.hpp"
 
 namespace Components
 {
@@ -34,13 +33,6 @@ namespace Components
   // hid itself (attachments' hideTags).
   // Skins change the gun model's material list (XModel::materialHandles) in
   // this game's memory - put back before every map change / disconnect.
-  // Per-hand anim (more addresses):
-  //   0x417542  call 0x50B9B0 = add a view model DObj to the scene
-  //             (obj, placement, entnum 0x7FF / 0x7FE akimbo left, ...)
-  //   0x428400  clear a DObj's skeleton (the game does it every frame)
-  //   0x430780  ClientDObjCreate(models, count, tree, handle, lc)
-  //   0x43FFF0  ClientDObjFree(handle); handles 0x800 / 0x801 = view model
-  //   0x4CE030 / 0x4A03B0  create / free an anim tree
   // =====================================================================
   namespace
   {
@@ -78,218 +70,6 @@ namespace Components
     Game::DObj* HandDObj(const int hand)
     {
       return *reinterpret_cast<Game::DObj**>(VIEWMODEL_HANDS + hand * VIEWMODEL_HAND_SIZE);
-    }
-
-    // --- per-hand animation -------------------------------------------------
-    // A second copy of your arms (its own DObj + anim tree, handle 0x801 -
-    // the akimbo left gun's slot, unused on a normal gun) is drawn at the
-    // same spot as the view model, playing its own anim. The picked arm is
-    // hidden on the normal view model and only shown on the copy, so that
-    // arm plays anim A while the other arm + gun keep playing the game's.
-    struct DObjModel
-    {
-      Game::XModel* model;
-      unsigned short boneName;
-      bool ignoreCollision;
-    };
-    static_assert(sizeof(DObjModel) == 8);
-
-    using ClientDObjCreate_t = Game::DObj*(*)(DObjModel* models, int numModels, Game::XAnimTree_s* tree, int handle, int localClientNum);
-    const auto ClientDObjCreate = reinterpret_cast<ClientDObjCreate_t>(0x430780);
-    using ClientDObjFree_t = void(*)(int handle);
-    const auto ClientDObjFree = reinterpret_cast<ClientDObjFree_t>(0x43FFF0);
-    using XAnimCreateSmallTree_t = Game::XAnimTree_s*(*)(void* anims);
-    const auto XAnimCreateSmallTree = reinterpret_cast<XAnimCreateSmallTree_t>(0x4CE030);
-    using XAnimFreeTree_t = void(*)(Game::XAnimTree_s* tree);
-    const auto XAnimFreeTree = reinterpret_cast<XAnimFreeTree_t>(0x4A03B0);
-    using XAnimSetGoalWeight_t = int(*)(Game::DObj* obj, unsigned int anim, float weight, float goalTime, float rate, unsigned int notifyName, unsigned int notifyType, int restart);
-    const auto XAnimSetGoalWeight = reinterpret_cast<XAnimSetGoalWeight_t>(0x444B90);
-    using XAnimSetTime_t = void(*)(Game::XAnimTree_s* tree, unsigned int anim, float time);
-    const auto XAnimSetTime = reinterpret_cast<XAnimSetTime_t>(0x4DC640);
-    using DObjSkelClear_t = void(*)(Game::DObj* obj);
-    const auto DObjSkelClear = reinterpret_cast<DObjSkelClear_t>(0x428400); // the game does this per hand per frame
-    using AddDObjToScene_t = void(*)(Game::DObj* obj, float* placement, int entnum, int flags, float* lightingOrigin, float materialTime, int extra);
-    const auto AddDObjToScene = reinterpret_cast<AddDObjToScene_t>(0x50B9B0);
-
-    constexpr int HANDANIM_HANDLE = 0x801;
-    constexpr std::uintptr_t CLIENT_DOBJ_HANDLES = 0x1B288B0;  // short per handle -> pool slot
-    constexpr std::uintptr_t CLIENT_DOBJ_POOL = 0x1ADA8A8;     // DObj pool, 0x9C each
-    constexpr std::uintptr_t WEAPON_ANIM_SETS = 0x4EF57A;      // operand: per weapon XAnim_s* x3
-    constexpr std::uintptr_t WEAPON_VIEWMODEL_CACHE = 0x7E3CC8; // per weapon, stride 0x20, +0x0 hands XModel*
-
-    struct
-    {
-      Game::DObj* obj = nullptr;
-      Game::XAnimTree_s* tree = nullptr;
-      unsigned int weapon = 0;
-      Game::XModel* hands = nullptr;
-      bool drawn = false;       // drawn this frame (hide the arm on the real one)
-      bool clip = false;        // Anim Clip drives it (Hand: Left Arm / Right Arm + Gun)
-      int builtArm = -1;        // which arm the copy shows
-      std::string why;          // last reason it isn't drawn (console)
-      unsigned int realBits[6]{}; // bits we set on the real view model
-    } handAnim;
-
-    bool HandAnimObjAlive()
-    {
-      if (!handAnim.obj) return false;
-      const auto slot = *reinterpret_cast<short*>(CLIENT_DOBJ_HANDLES + HANDANIM_HANDLE * 2);
-      return slot && reinterpret_cast<Game::DObj*>(CLIENT_DOBJ_POOL + slot * 0x9C) == handAnim.obj;
-    }
-
-    // forget it without freeing (map change - the game clears its pools)
-    void HandAnimDrop()
-    {
-      handAnim.obj = nullptr;
-      handAnim.tree = nullptr;
-      handAnim.weapon = 0;
-      handAnim.hands = nullptr;
-      handAnim.drawn = false;
-      handAnim.builtArm = -1;
-    }
-
-    void HandAnimDestroy()
-    {
-      if (HandAnimObjAlive()) ClientDObjFree(HANDANIM_HANDLE);
-      if (handAnim.tree) XAnimFreeTree(handAnim.tree);
-      HandAnimDrop();
-    }
-
-    bool ArmBone(const char* name, const int arm)
-    {
-      if (!name) return false;
-      const auto len = std::strlen(name);
-      return len > 3 && std::strcmp(name + len - 3, arm == 0 ? "_le" : "_ri") == 0;
-    }
-
-    // hide every bone of one arm (or of the other one) on a DObj
-    void SetArmBits(Game::DObj* obj, const Game::XModel* hands, const int arm, unsigned int* outBits)
-    {
-      if (!obj || !hands || !hands->boneNames) return;
-      for (auto b = 0; b < hands->numBones; ++b)
-      {
-        const auto* name = Game::SL_ConvertToString(static_cast<Game::scr_string_t>(hands->boneNames[b]));
-        if (!ArmBone(name, arm)) continue;
-        unsigned char index = 0xFE;
-        if (!DObjGetBoneIndex(obj, hands->boneNames[b], &index) || index >= 192) continue;
-        const auto bit = 0x80000000u >> (index & 31);
-        if (obj->hidePartBits[index >> 5] & bit) continue;
-        obj->hidePartBits[index >> 5] |= bit;
-        if (outBits) outBits[index >> 5] |= bit;
-      }
-    }
-
-    void ClearRealBits(Game::DObj* real)
-    {
-      if (real)
-      {
-        for (auto i = 0; i < 6; ++i) real->hidePartBits[i] &= ~handAnim.realBits[i];
-      }
-      std::memset(handAnim.realBits, 0, sizeof(handAnim.realBits));
-    }
-
-    void* WeaponAnims(const unsigned int weapon)
-    {
-      const auto base = *reinterpret_cast<std::uintptr_t*>(WEAPON_ANIM_SETS);
-      if (!base) return nullptr;
-      return *reinterpret_cast<void**>(base + weapon * 3 * sizeof(std::uintptr_t));
-    }
-
-    bool NotReady(const char* reason)
-    {
-      if (handAnim.why != reason)
-      {
-        handAnim.why = reason;
-        Logger::Print("animclip arm: not drawn - {}\n", reason);
-      }
-      return false;
-    }
-
-    // build / keep the copy for the gun you're holding; false = don't draw it
-    bool HandAnimReady()
-    {
-      handAnim.clip = Weapon::AnimClip_SplitActive();
-      if (!handAnim.clip || !InGame()) return false;
-      constexpr auto arm = 0; // the copy is the left arm
-
-      // akimbo: that slot is the left gun's
-      if (*reinterpret_cast<Game::DObj**>(VIEWMODEL_HANDS + VIEWMODEL_HAND_SIZE)) { HandAnimDrop(); return NotReady("akimbo gun"); }
-
-      const auto weapon = CurrentWeapon();
-      auto* hands = weapon ? *reinterpret_cast<Game::XModel**>(WEAPON_VIEWMODEL_CACHE + weapon * 0x20) : nullptr;
-      auto* anims = weapon ? WeaponAnims(weapon) : nullptr;
-      if (!weapon) return NotReady("no weapon");
-      if (!hands) return NotReady("no hands model for this gun");
-      if (!anims) return NotReady("no anims for this gun");
-
-      if (handAnim.obj && (!HandAnimObjAlive() || handAnim.weapon != weapon || handAnim.hands != hands || handAnim.builtArm != arm))
-      {
-        HandAnimDestroy();
-      }
-
-      if (!handAnim.obj)
-      {
-        handAnim.tree = XAnimCreateSmallTree(anims);
-        if (!handAnim.tree) return NotReady("couldn't make an anim tree");
-        DObjModel model{ hands, 0, true };
-        handAnim.obj = ClientDObjCreate(&model, 1, handAnim.tree, HANDANIM_HANDLE, 0);
-        if (!handAnim.obj)
-        {
-          XAnimFreeTree(handAnim.tree);
-          HandAnimDrop();
-          return NotReady("couldn't make the arm copy");
-        }
-        handAnim.weapon = weapon;
-        handAnim.hands = hands;
-        // root blend node on, like the game does for the view model
-        XAnimSetGoalWeight(handAnim.obj, 0, 1.0f, 0.0f, 1.0f, 0, 1, 0);
-        // the copy only shows the picked arm
-        SetArmBits(handAnim.obj, hands, arm == 0 ? 1 : 0, nullptr);
-        handAnim.builtArm = arm;
-        auto shown = 0;
-        for (auto b = 0; b < hands->numBones; ++b)
-        {
-          if (ArmBone(Game::SL_ConvertToString(static_cast<Game::scr_string_t>(hands->boneNames[b])), arm)) ++shown;
-        }
-        Logger::Print("animclip arm: arm copy made for {} ({} bones, {} in the {} arm)\n", hands->name ? hands->name : "?", hands->numBones, shown, arm == 0 ? "left" : "right");
-      }
-
-      handAnim.why.clear();
-      return true; // Anim Clip (Weapon.cpp) drives the copy's anims
-    }
-
-    // 0x417542: the view model hands are added to the scene here (entnum 0x7FF
-    // = the gun you hold, 0x7FE = akimbo left gun). We add the copy after.
-    void AddViewDObj_Hk(Game::DObj* obj, float* placement, const int entnum, const int flags, float* lightingOrigin, const float materialTime, const int extra)
-    {
-      if (entnum == 0x7FF)
-      {
-        ClearRealBits(obj);
-        handAnim.drawn = HandAnimReady();
-        if (handAnim.drawn)
-        {
-          SetArmBits(obj, handAnim.hands, handAnim.builtArm, handAnim.realBits);
-        }
-      }
-
-      AddDObjToScene(obj, placement, entnum, flags, lightingOrigin, materialTime, extra);
-
-      if (entnum == 0x7FF && handAnim.drawn)
-      {
-        DObjSkelClear(handAnim.obj);
-        AddDObjToScene(handAnim.obj, placement, 0x7FE, flags, lightingOrigin, materialTime, extra);
-      }
-    }
-
-    // 0x59C196: the game builds a view model DObj. If it's about to use our
-    // slot (switching to akimbo) free ours first so nothing leaks.
-    Game::DObj* ViewDObjCreate_Hk(DObjModel* models, const int numModels, Game::XAnimTree_s* tree, const int handle, const int localClientNum)
-    {
-      if (handle == HANDANIM_HANDLE && handAnim.obj)
-      {
-        HandAnimDestroy();
-      }
-      return ClientDObjCreate(models, numModels, tree, handle, localClientNum);
     }
 
     // --- quaternion helpers (x, y, z, w) --------------------------------
@@ -385,11 +165,6 @@ namespace Components
     {
       return (mat && mat->info.name) ? mat->info.name : "";
     }
-  }
-
-  Game::DObj* ViewModelEditor::SplitCopy()
-  {
-    return (handAnim.clip && HandAnimObjAlive()) ? handAnim.obj : nullptr;
   }
 
   void ViewModelEditor::RestoreAll()
@@ -509,8 +284,6 @@ namespace Components
     if (Dedicated::IsEnabled()) return;
 
     Utils::Hook(0x4AB212, CalcWeaponPosition_Stub, HOOK_CALL).install()->quick();
-    Utils::Hook(0x417542, AddViewDObj_Hk, HOOK_CALL).install()->quick();
-    Utils::Hook(0x59C196, ViewDObjCreate_Hk, HOOK_CALL).install()->quick();
 
     const auto floats = [](const Command::Params* params, float* out, const int count)
     {
@@ -633,7 +406,7 @@ namespace Components
     });
 
     // weapon indices / models belong to the map
-    Events::OnCLDisconnected([](bool) { RestoreAll(); hidden.clear(); HandAnimDrop(); std::memset(handAnim.realBits, 0, sizeof(handAnim.realBits)); });
-    Events::OnCGameInit([] { RestoreAll(); hidden.clear(); HandAnimDrop(); std::memset(handAnim.realBits, 0, sizeof(handAnim.realBits)); });
+    Events::OnCLDisconnected([](bool) { RestoreAll(); hidden.clear(); });
+    Events::OnCGameInit([] { RestoreAll(); hidden.clear(); });
   }
 }

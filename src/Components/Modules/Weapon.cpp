@@ -3,7 +3,6 @@
 #include "GSC/Script.hpp"
 #include "Events.hpp"
 #include "ClientCommand.hpp"
-#include "ViewModelEditor.hpp"
 
 namespace Components
 {
@@ -1354,26 +1353,10 @@ namespace Components
 			return animClipDebug && animClipDebug->current.enabled;
 		}
 
-		// does this layer play on this hand? (hand 0 = right / the only gun, 1 = akimbo left,
-		// 2 = the left-arm copy ViewModelEditor draws on a normal gun)
-		// hands: 0 both, 1 right, 2 left (akimbo), 3 left arm, 4 right arm + gun (normal gun)
+		// does this layer play on this hand? (hand 0 = right / the only gun, 1 = akimbo left)
 		bool LayerOnHand(const AnimClipLayer& layer, const int hand)
 		{
-			switch (hand)
-			{
-			case 0: return layer.hands == 0 || layer.hands == 1 || layer.hands == 4;
-			case 1: return layer.hands == 0 || layer.hands == 2;
-			case 2: return layer.hands == 3;
-			default: return false;
-			}
-		}
-
-		// the hand whose frame works a layer out; the others copy it
-		int LayerDriver(const AnimClipLayer& layer)
-		{
-			if (layer.hands == 2) return 1;
-			if (layer.hands == 3) return 2;
-			return 0;
+			return layer.hands == 0 || (layer.hands == 1 && hand == 0) || (layer.hands == 2 && hand == 1);
 		}
 
 		// knifing or throwing (throwing knife, grenade, tac) right now?
@@ -1407,10 +1390,9 @@ namespace Components
 
 		// How many times a second this weapon's anim plays through (1 / length),
 		// from its XAnimParts. 0 if unknown.
-		float ClipAnimFrequency(const Game::playerState_s* ps, const int handIn, const unsigned int anim)
+		float ClipAnimFrequency(const Game::playerState_s* ps, const int hand, const unsigned int anim)
 		{
 			if (!ps) return 0.0f;
-			const auto hand = handIn == 1 ? 1 : 0; // the arm copy (2) uses the gun's own anims
 			const auto weapon = ps->weapCommon.weapon;
 			static unsigned int cachedWeapon = 0xFFFFFFFF;
 			static float cache[Game::NUM_WEAPON_HANDS][CLIP_LAST_ANIM + 1]{};
@@ -1496,7 +1478,7 @@ namespace Components
 		layer.weightCurve = (weightCurve >= 0 && weightCurve < CURVE_COUNT) ? weightCurve : CURVE_FLAT;
 		layer.holdMs = std::clamp(holdMs, 0, 60000);
 		layer.blendMs = std::clamp(blendMs, 0, 10000);
-		layer.hands = (hands >= 0 && hands <= 4) ? hands : 0;
+		layer.hands = (hands >= 0 && hands <= 2) ? hands : 0;
 
 		layer.frozen = false;
 		layer.fading = false;
@@ -1591,74 +1573,16 @@ namespace Components
 		}
 	}
 
-	namespace
-	{
-		// The left-arm copy with no clip of its own: play what the game plays
-		// on the real view model (its weapAnim), on our own clock - the copy's
-		// tree isn't ticked by the game.
-		struct
-		{
-			int raw = -1;
-			unsigned int anim = 0;
-			float time = 0.0f;
-			int tick = 0;
-		} splitMirror;
-
-		void SplitMirrorGame(Game::DObj* obj, Game::playerState_s* ps)
-		{
-			if (!ps) return;
-			auto* tree = DObjGetTree(obj);
-			const auto raw = ps->weapState[Game::WEAPON_HAND_RIGHT].weapAnim;
-			auto anim = static_cast<unsigned int>(raw) & 0x1FFu;
-			if (anim < CLIP_FIRST_ANIM || anim > CLIP_LAST_ANIM) anim = Game::WEAP_ANIM_IDLE;
-			const auto gameNow = Game::CL_IsCgameInitialized() ? Game::cgArray[0].time : Game::Sys_Milliseconds();
-
-			if (raw != splitMirror.raw || anim != splitMirror.anim)
-			{
-				splitMirror.raw = raw;
-				splitMirror.anim = anim;
-				splitMirror.time = 0.0f;
-				splitMirror.tick = gameNow;
-				for (auto i = CLIP_FIRST_ANIM; i <= CLIP_LAST_ANIM; ++i)
-				{
-					if (i != anim) XAnimSetGoalWeight(obj, i, 0.0f, 0.0f, 0.0f, 0, 0, 0);
-				}
-				XAnimSetGoalWeight(obj, anim, 1.0f, 0.0f, 0.0f, 0, 0, 1);
-			}
-
-			const auto dt = std::clamp(static_cast<float>(gameNow - splitMirror.tick) / 1000.0f, 0.0f, 0.25f);
-			splitMirror.tick = gameNow;
-			splitMirror.time += dt * ClipAnimFrequency(ps, 0, anim);
-			const auto loops = anim == Game::WEAP_ANIM_IDLE || anim == Game::WEAP_ANIM_EMPTY_IDLE || anim == Game::WEAP_ANIM_SPRINT_LOOP || anim == Game::WEAP_ANIM_STUNNED_LOOP;
-			if (loops) splitMirror.time -= std::floor(splitMirror.time);
-			XAnimSetTime(tree, anim, std::min(splitMirror.time, CLIP_MAX_TIME));
-		}
-	}
-
 	// The clip runs on its own clock: the engine plays the anim at the
 	// layer's rate, we read how far it moved since last frame, then put it
 	// where WE want it (forwards, backwards, bounced...). So reverse and
 	// ping-pong need no anim lengths - the engine measures the step for us.
 	void Weapon::AnimClip_Frame([[maybe_unused]] Game::playerState_s* ps, const int hand)
 	{
-		if (hand < 0 || hand > 2 || !AnyClipActive()) return;
+		if (hand < 0 || hand >= Game::NUM_WEAPON_HANDS || !AnyClipActive()) return;
 
-		// hand 2: the left-arm copy (Hand: Left Arm / Right Arm + Gun on a normal gun)
-		auto* obj = hand == 2 ? ViewModelEditor::SplitCopy() : *reinterpret_cast<Game::DObj**>(GetViewmodelHand(hand));
+		auto* obj = *reinterpret_cast<Game::DObj**>(GetViewmodelHand(hand));
 		if (!obj || !obj->tree) return;
-		const auto ws = hand == 1 ? 1 : 0; // weapState of this hand
-
-		if (hand == 2)
-		{
-			auto onCopy = false;
-			for (const auto& layer : animClipLayers) onCopy = onCopy || (layer.active && LayerOnHand(layer, 2));
-			if (!onCopy)
-			{
-				SplitMirrorGame(obj, ps);
-				return;
-			}
-			splitMirror.raw = -1; // a clip has the arm - restart the game's anim after it
-		}
 
 		auto* tree = DObjGetTree(obj);
 		const auto keepAds = animClipKeepAds && animClipKeepAds->current.enabled;
@@ -1706,7 +1630,7 @@ namespace Components
 		auto gameAnim = 0u;
 		if (anyOnHand && !anyPlaying && ps)
 		{
-			gameAnim = static_cast<unsigned int>(ps->weapState[ws].weapAnim) & 0x1FFu;   // drop the toggle bit
+			gameAnim = static_cast<unsigned int>(ps->weapState[hand].weapAnim) & 0x1FFu;   // drop the toggle bit
 			if (gameAnim < CLIP_FIRST_ANIM || gameAnim > CLIP_LAST_ANIM || used[gameAnim])
 				gameAnim = 0;
 		}
@@ -1734,7 +1658,7 @@ namespace Components
 
 			// The layer's own hand works the clip out; with "both hands" the
 			// left (akimbo) gun just copies what the right one worked out.
-			const auto driver = LayerDriver(layer);
+			const auto driver = (layer.hands == 2) ? 1 : 0;
 			if (hand != driver)
 			{
 				XAnimSetGoalWeight(obj, anim, layer.outWeight, 0.0f, layer.outRate, 0, 0, 0);
@@ -2330,16 +2254,6 @@ namespace Components
 		RestorePlayerOverrides(saved);
 
 		AnimClip_Frame(ps, hand);
-		if (hand == 0) AnimClip_Frame(ps, 2); // the arm copy, if there is one
-	}
-
-	bool Weapon::AnimClip_SplitActive()
-	{
-		for (const auto& layer : animClipLayers)
-		{
-			if (layer.active && (layer.hands == 3 || layer.hands == 4)) return true;
-		}
-		return false;
 	}
 
 	__declspec(naked) void Weapon::CallWeaponRunXModelAnims([[maybe_unused]] Game::playerState_s* ps, [[maybe_unused]] int hand)
