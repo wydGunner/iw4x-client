@@ -39,6 +39,11 @@ namespace Components
 
     static Var Name;
 
+    // OMEN: called right after the server sets one of our dvars (setClientDvar),
+    // once per value that arrives - polling can miss one when two land in the
+    // same frame
+    static void OnServerSet(const std::function<void(const char* dvarName, const char* value)>& callback);
+
   private:
 
     static const Game::dvar_t* Dvar_RegisterName(const char* dvarName, const char* value, std::uint16_t flags, const char* description);
@@ -48,11 +53,6 @@ namespace Components
 
     static void SetFromStringByNameExternal(const char* dvarName, const char* string);
     static void SetFromStringByNameSafeExternal(const char* dvarName, const char* string);
-
-    // OMEN: called right after the server sets one of our dvars (setClientDvar),
-    // once per value that arrives - polling can miss one when two land in the
-    // same frame
-    static void OnServerSet(const std::function<void(const char* dvarName, const char* value)>& callback);
 
     static bool AreArchiveDvarsUnprotected();
     static bool IsSettingDvarsDisabled();
