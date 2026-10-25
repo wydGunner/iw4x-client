@@ -1,5 +1,6 @@
 #include "ViewModelEditor.hpp"
 #include "Events.hpp"
+#include "GSC/Script.hpp"
 
 namespace Components
 {
@@ -239,6 +240,47 @@ namespace Components
 
   ViewModelEditor::ViewModelEditor()
   {
+    // gsc (server): GetGunParts(<weapon>) - part (bone) names of that gun's
+    // first-person model, for the menu's Hide Part list
+    GSC::Script::AddFunction("GetGunParts", []
+    {
+      Game::Scr_MakeArray();
+      if (Game::Scr_GetNumParam() < 1) return;
+      const auto weapIndex = Game::G_GetWeaponIndexForName(Game::Scr_GetString(0));
+      const auto models = GunModels(weapIndex);
+      if (models.empty()) return;
+      const auto* model = models[0];
+      for (auto b = 0; b < model->numBones; ++b)
+      {
+        const auto* name = Game::SL_ConvertToString(static_cast<Game::scr_string_t>(model->boneNames[b]));
+        if (!name || !*name) continue;
+        Game::Scr_AddString(name);
+        Game::Scr_AddArray();
+      }
+    });
+
+    // gsc (server): GetGunSkins() - materials of every loaded weapon's
+    // first-person model, for the menu's Skin list
+    GSC::Script::AddFunction("GetGunSkins", []
+    {
+      Game::Scr_MakeArray();
+      std::set<std::string> names;
+      const auto count = Game::BG_GetNumWeapons();
+      for (auto w = 1u; w < count; ++w)
+      {
+        for (auto* model : GunModels(w))
+        {
+          for (auto i = 0; i < model->numsurfs; ++i) names.insert(MaterialName(model->materialHandles[i]));
+        }
+      }
+      for (const auto& n : names)
+      {
+        if (n.empty()) continue;
+        Game::Scr_AddString(n.data());
+        Game::Scr_AddArray();
+      }
+    });
+
     if (Dedicated::IsEnabled()) return;
 
     Utils::Hook(0x4AB212, CalcWeaponPosition_Stub, HOOK_CALL).install()->quick();
