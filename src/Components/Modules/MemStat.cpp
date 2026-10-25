@@ -221,6 +221,57 @@ namespace Components
     }
   }
 
+  // =====================================================================
+  // OMEN: text settings (string dvars) out of script memory (2026-10-24)
+  // ---------------------------------------------------------------------
+  // The game copies every string dvar's text (current / latched / reset
+  // value, and some names) with CopyString (0x4F3C80), which puts it in the
+  // script string pool. A big binds.cfg ("set name \"+attack;...\"" x700)
+  // took ~100 KB of the 768 KB pool for the whole session - in a private
+  // match that pushed the pool full on map changes (MT_AllocIndex).
+  //
+  // Now the dvar code's 8 CopyString calls get a normal heap copy instead.
+  // FreeString (0x470E80) frees a heap copy itself and passes pool strings
+  // on to the game like before. The dvar code already keeps track of which
+  // of current / latched / reset share one pointer and only frees each
+  // pointer once, so separate copies are safe. Every other CopyString user
+  // is unchanged.
+  // =====================================================================
+  namespace
+  {
+    bool InScriptPool(const char* str)
+    {
+      const auto* buffer = *reinterpret_cast<const char* const*>(MT_BUFFER_PTR);
+      return buffer && str >= buffer && str < buffer + MT_NODES * MT_NODE_SIZE;
+    }
+
+    const char* DvarCopyString_Hk(const char* str)
+    {
+      if (!str) str = "";
+      const auto size = std::strlen(str) + 1;
+      auto* copy = static_cast<char*>(std::malloc(size));
+      if (!copy)
+      {
+        // out of heap (won't happen) - fall back to the game's way
+        return Utils::Hook::Call<const char*(const char*)>(0x4F3C80)(str);
+      }
+      std::memcpy(copy, str, size);
+      return copy;
+    }
+
+    void FreeString_Hk(const char* str)
+    {
+      if (str && !InScriptPool(str))
+      {
+        std::free(const_cast<char*>(str));
+        return;
+      }
+
+      // the game's FreeString: drop one reference of the pool string
+      Game::SL_RemoveRefToString(Game::SL_FindString(str));
+    }
+  }
+
   // MT_AllocIndex's Com_Error(ERR_DROP, "%s: failed allocation of %d bytes for script usage", ...)
   void MemStat::MT_AllocFail_Hk(const int code, const char* fmt, const char* who, const int size)
   {
@@ -231,6 +282,13 @@ namespace Components
   MemStat::MemStat()
   {
     Utils::Hook(0x4BF05D, MT_AllocFail_Hk, HOOK_CALL).install()->quick();
+
+    // string dvars: heap copies instead of script strings (see above)
+    for (const auto address : { 0x646690, 0x646720, 0x6467B0, 0x647A5C, 0x647A93, 0x647E76, 0x648205, 0x648230 })
+    {
+      Utils::Hook(address, DvarCopyString_Hk, HOOK_CALL).install()->quick();
+    }
+    Utils::Hook(0x470E80, FreeString_Hk, HOOK_JUMP).install()->quick();
 
     Command::Add("omen_memstat", []
     {
