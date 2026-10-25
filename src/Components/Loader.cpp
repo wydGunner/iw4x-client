@@ -10,6 +10,7 @@
 #include "Modules/Bullet.hpp"
 #include "Modules/MemStat.hpp"
 #include "Modules/ForceModel.hpp"
+#include "Modules/ViewModelEditor.hpp"
 #include "Modules/CardTitles.hpp"
 #include "Modules/Ceg.hpp"
 #include "Modules/Changelog.hpp"
@@ -124,6 +125,7 @@ namespace Components
     Register(new Bullet());
     Register(new MemStat());
     Register(new ForceModel());
+    Register(new ViewModelEditor());
     Register(new CardTitles());
     Register(new Ceg());
     Register(new Changelog());

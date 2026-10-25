@@ -1,5 +1,6 @@
 #include "Maps.hpp"
 #include "ForceModel.hpp"
+#include "ViewModelEditor.hpp"
 #include "ArenaLength.hpp"
 #include "FastFiles.hpp"
 #include "RawFiles.hpp"
@@ -539,6 +540,7 @@ namespace Components
 
     // OMEN: put forced first-person models back before this map goes away
     ForceModel::RestoreAll();
+    ViewModelEditor::RestoreAll();
 
     char hashBuf[100] = { 0 };
     unsigned int hash = atoi(Game::MSG_ReadStringLine(msg, hashBuf, sizeof(hashBuf)));
