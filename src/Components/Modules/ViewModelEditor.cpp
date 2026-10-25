@@ -20,6 +20,7 @@ namespace Components
   //       where: gun (default) / arms / a part (bone) of the gun or arms
   //   vm_skin reset                       gun + arms back
   //   vm_reset                            everything back
+  //   flip <back|front|left|right> [ms]   your view does a full flip (only you)
   //
   // Engine (iw4x.exe, found by disassembly):
   //   0x4AB212  CG_AddViewWeapon calls 0x59CA90, which fills the view
@@ -57,6 +58,69 @@ namespace Components
     std::unordered_map<Game::XModel*, std::vector<Game::Material*>> savedSkins;
 
     DWORD stubReturn = 0;
+
+    // --- view flip ------------------------------------------------------------
+    // 0x486D37 calls CG_AddViewWeapon(lc) (0x4AB140) once the view for this frame
+    // is worked out (cg.refdefViewAngles 0x85F650, cg.refdef.view.axis 0x85B714,
+    // the game rebuilds both every frame). We turn both a bit further before the
+    // gun is placed, so the gun turns with the view and the frame is drawn flipped.
+    constexpr std::uintptr_t REFDEF_VIEW_ANGLES = 0x85F650;
+    constexpr std::uintptr_t REFDEF_VIEW_AXIS = 0x85B714;
+    using AddViewWeapon_t = void(*)(int localClientNum);
+    const auto AddViewWeapon = reinterpret_cast<AddViewWeapon_t>(0x4AB140);
+
+    struct
+    {
+      bool active = false;
+      int type = 0;      // 0 back, 1 front, 2 left, 3 right
+      int start = 0;     // cg.time
+      int ms = 600;
+    } flip;
+
+    // v about unit axis k by a radians
+    void RotateAbout(float* v, const float* k, const float a)
+    {
+      const auto c = std::cos(a), sn = std::sin(a);
+      const float cross[3] = { k[1] * v[2] - k[2] * v[1], k[2] * v[0] - k[0] * v[2], k[0] * v[1] - k[1] * v[0] };
+      const auto dot = k[0] * v[0] + k[1] * v[1] + k[2] * v[2];
+      for (auto i = 0; i < 3; ++i) v[i] = v[i] * c + cross[i] * sn + k[i] * dot * (1.0f - c);
+    }
+
+    void AddViewWeapon_Hk(const int localClientNum)
+    {
+      if (flip.active && Game::CL_IsCgameInitialized())
+      {
+        const auto now = Game::cgArray[0].time;
+        auto u = static_cast<float>(now - flip.start) / static_cast<float>(std::max(flip.ms, 1));
+        if (u >= 1.0f || u < 0.0f)
+        {
+          flip.active = false;
+        }
+        else
+        {
+          const auto ease = u * u * (3.0f - 2.0f * u);           // slow - fast - slow
+          const auto deg = 360.0f * ease;
+          auto* angles = reinterpret_cast<float*>(REFDEF_VIEW_ANGLES);
+          auto* axis = reinterpret_cast<float(*)[3]>(REFDEF_VIEW_AXIS);
+          float k[3];
+          float a = 0.0f;
+          switch (flip.type)
+          {
+          case 0: // backflip: looking up and over (pitch going negative), about the left axis
+            angles[0] -= deg; a = -deg; std::memcpy(k, axis[1], sizeof(k)); break;
+          case 1: // frontflip
+            angles[0] += deg; a = deg; std::memcpy(k, axis[1], sizeof(k)); break;
+          case 2: // left: roll to the left, about the forward axis
+            angles[2] -= deg; a = -deg; std::memcpy(k, axis[0], sizeof(k)); break;
+          default: // right
+            angles[2] += deg; a = deg; std::memcpy(k, axis[0], sizeof(k)); break;
+          }
+          const auto rad = a * 3.14159265f / 180.0f;
+          for (auto i = 0; i < 3; ++i) RotateAbout(axis[i], k, rad);
+        }
+      }
+      AddViewWeapon(localClientNum);
+    }
 
     bool InGame()
     {
@@ -367,6 +431,7 @@ namespace Components
     if (Dedicated::IsEnabled()) return;
 
     Utils::Hook(0x4AB212, CalcWeaponPosition_Stub, HOOK_CALL).install()->quick();
+    Utils::Hook(0x486D37, AddViewWeapon_Hk, HOOK_CALL).install()->quick();
 
     const auto floats = [](const Command::Params* params, float* out, const int count)
     {
@@ -498,6 +563,19 @@ namespace Components
         }
       }
       if (!painted) Logger::Print("vm_skin: nothing to paint on '{}' (vm_parts shows the parts)\n", where);
+    });
+
+    Command::Add("flip", [](const Command::Params* params)
+    {
+      const std::string kind = params->size() > 1 ? Utils::String::ToLower(params->get(1)) : "back";
+      if (kind == "front") flip.type = 1;
+      else if (kind == "left") flip.type = 2;
+      else if (kind == "right") flip.type = 3;
+      else flip.type = 0;
+      flip.ms = params->size() > 2 ? std::clamp(std::atoi(params->get(2)), 150, 5000) : 600;
+      if (!Game::CL_IsCgameInitialized()) return;
+      flip.start = Game::cgArray[0].time;
+      flip.active = true;
     });
 
     Command::Add("vm_reset", []
