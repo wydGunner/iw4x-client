@@ -18,9 +18,6 @@ namespace Components
   //   vm_skins [text]                     skins (materials) you can use
   //   vm_skin <material> / vm_skin reset  paint the gun you're holding
   //   vm_reset                            everything back
-  //   vm_attach <model> <part>            stick a loaded model onto a part
-  //   vm_detach <model>                   take that model off
-  //   vm_attach_list / vm_attach_reset    what's attached / take all off
   //
   // Engine (iw4x.exe, found by disassembly):
   //   0x4AB212  CG_AddViewWeapon calls 0x59CA90, which fills the view
@@ -36,13 +33,6 @@ namespace Components
   // hid itself (attachments' hideTags).
   // Skins change the gun model's material list (XModel::materialHandles) in
   // this game's memory - put back before every map change / disconnect.
-  // Attached models: at 0x59C196 the game builds the first-person DObj
-  // (hands + gun + ...) from a DObjModel_s list {XModel*, parent bone name,
-  // ignoreCollision} with 0x430780(models, count, tree, handle, lc). We
-  // hand it a copy of that list with our models added. The game's limits
-  // are 32 models and 192 bones per DObj (more bones = fatal error), so we
-  // check both. 0x59BEB0 rebuilds the view model; the game calls it that
-  // way on a camo change, we do the same so a change shows right away.
   // =====================================================================
   namespace
   {
@@ -75,97 +65,6 @@ namespace Components
     {
       if (!InGame()) return 0;
       return static_cast<unsigned int>(Game::BG_GetViewModelWeaponIndex(&Game::cgArray[0].predictedPlayerState));
-    }
-
-    // --- attached models -------------------------------------------------
-    struct DObjModel
-    {
-      Game::XModel* model;
-      unsigned short boneName;
-      bool ignoreCollision;
-    };
-    static_assert(sizeof(DObjModel) == 8);
-
-    struct Attachment
-    {
-      std::string model;
-      std::string part;
-    };
-    constexpr std::size_t MAX_ATTACH = 4;
-    std::vector<Attachment> attachments;
-
-    using ClientDObjCreate_t = void*(*)(DObjModel* models, int numModels, void* tree, int handle, int localClientNum);
-    const auto ClientDObjCreate = reinterpret_cast<ClientDObjCreate_t>(0x430780);
-
-    using ChangeViewmodelDObj_t = void(*)(int localClientNum, Game::playerState_s* ps, unsigned int weapon, Game::XModel* hands, int newTree, int updateClientInfo);
-    const auto ChangeViewmodelDObj = reinterpret_cast<ChangeViewmodelDObj_t>(0x59BEB0);
-    constexpr std::uintptr_t WEAPON_VIEWMODEL_CACHE = 0x7E3CC8; // per weapon, stride 0x20, +0x0 hands XModel*
-
-    Game::XModel* FindModel(const char* name)
-    {
-      if (!name || !*name) return nullptr;
-      if (Game::DB_IsXAssetDefault(Game::ASSET_TYPE_XMODEL, name)) return nullptr;
-      return Game::DB_FindXAssetHeader(Game::ASSET_TYPE_XMODEL, name).model;
-    }
-
-    bool HasBone(const Game::XModel* model, const unsigned int name)
-    {
-      if (!model || !model->boneNames) return false;
-      for (auto b = 0; b < model->numBones; ++b)
-      {
-        if (model->boneNames[b] == name) return true;
-      }
-      return false;
-    }
-
-    void* ClientDObjCreate_Hk(DObjModel* models, const int numModels, void* tree, const int handle, const int localClientNum)
-    {
-      if (attachments.empty() || !models || numModels <= 0 || numModels > 16)
-      {
-        return ClientDObjCreate(models, numModels, tree, handle, localClientNum);
-      }
-
-      DObjModel list[32]{};
-      auto count = 0;
-      auto bones = 0;
-      for (auto i = 0; i < numModels; ++i)
-      {
-        list[count++] = models[i];
-        if (models[i].model) bones += models[i].model->numBones;
-      }
-
-      for (const auto& a : attachments)
-      {
-        if (count >= 24) break;
-        auto* model = FindModel(a.model.data());
-        if (!model) continue;
-        // only look the part name up - never adds a string (script memory)
-        const auto bone = Game::SL_FindString(a.part.data());
-        if (!bone || bone > 0xFFFF) continue;
-        auto found = false;
-        for (auto i = 0; i < count && !found; ++i) found = HasBone(list[i].model, bone);
-        if (!found) continue; // this gun doesn't have that part
-        if (bones + model->numBones > 192) continue;
-
-        list[count].model = model;
-        list[count].boneName = static_cast<unsigned short>(bone);
-        list[count].ignoreCollision = true;
-        bones += model->numBones;
-        ++count;
-      }
-
-      return ClientDObjCreate(list, count, tree, handle, localClientNum);
-    }
-
-    // build the first-person gun again so a change shows now
-    void RebuildViewModel()
-    {
-      if (!InGame()) return;
-      const auto weapon = CurrentWeapon();
-      if (!weapon) return;
-      auto* hands = *reinterpret_cast<Game::XModel**>(WEAPON_VIEWMODEL_CACHE + weapon * 0x20);
-      if (!hands) return;
-      ChangeViewmodelDObj(0, &Game::cgArray[0].predictedPlayerState, weapon, hands, 1, 0);
     }
 
     Game::DObj* HandDObj(const int hand)
@@ -385,7 +284,6 @@ namespace Components
     if (Dedicated::IsEnabled()) return;
 
     Utils::Hook(0x4AB212, CalcWeaponPosition_Stub, HOOK_CALL).install()->quick();
-    Utils::Hook(0x59C196, ClientDObjCreate_Hk, HOOK_CALL).install()->quick();
 
     const auto floats = [](const Command::Params* params, float* out, const int count)
     {
@@ -498,59 +396,6 @@ namespace Components
       }
     });
 
-    Command::Add("vm_attach", [](const Command::Params* params)
-    {
-      if (params->size() < 3)
-      {
-        Logger::Print("vm_attach <model> <part>   (forcemodel_list / vm_parts show what you can use)\n");
-        return;
-      }
-      const std::string model = params->get(1);
-      const std::string part = Utils::String::ToLower(params->get(2));
-      if (!FindModel(model.data()))
-      {
-        Logger::Print("vm_attach: '{}' isn't loaded on this map (forcemodel_list shows what is)\n", model);
-        return;
-      }
-      if (!Game::SL_FindString(part.data()))
-      {
-        Logger::Print("vm_attach: no part called '{}' (vm_parts shows them)\n", part);
-        return;
-      }
-      // same model again = move it to the new part
-      std::erase_if(attachments, [&](const Attachment& a) { return Utils::String::ToLower(a.model) == Utils::String::ToLower(model); });
-      if (attachments.size() >= MAX_ATTACH)
-      {
-        Logger::Print("vm_attach: {} models max - vm_detach one first\n", MAX_ATTACH);
-        return;
-      }
-      attachments.push_back({ model, part });
-      RebuildViewModel();
-    });
-
-    Command::Add("vm_detach", [](const Command::Params* params)
-    {
-      if (params->size() < 2) return;
-      const auto model = Utils::String::ToLower(params->get(1));
-      if (std::erase_if(attachments, [&](const Attachment& a) { return Utils::String::ToLower(a.model) == model; }))
-      {
-        RebuildViewModel();
-      }
-    });
-
-    Command::Add("vm_attach_reset", []
-    {
-      if (attachments.empty()) return;
-      attachments.clear();
-      RebuildViewModel();
-    });
-
-    Command::Add("vm_attach_list", []
-    {
-      if (attachments.empty()) Logger::Print("vm_attach: nothing attached\n");
-      for (const auto& a : attachments) Logger::Print("  {} on {}\n", a.model, a.part);
-    });
-
     Command::Add("vm_reset", []
     {
       offset[0] = offset[1] = offset[2] = 0.0f;
@@ -558,15 +403,10 @@ namespace Components
       scale = 1.0f;
       hidden.clear();
       RestoreAll();
-      if (!attachments.empty())
-      {
-        attachments.clear();
-        RebuildViewModel();
-      }
     });
 
     // weapon indices / models belong to the map
-    Events::OnCLDisconnected([](bool) { RestoreAll(); hidden.clear(); attachments.clear(); });
-    Events::OnCGameInit([] { RestoreAll(); hidden.clear(); attachments.clear(); });
+    Events::OnCLDisconnected([](bool) { RestoreAll(); hidden.clear(); });
+    Events::OnCGameInit([] { RestoreAll(); hidden.clear(); });
   }
 }
