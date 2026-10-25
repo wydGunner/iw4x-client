@@ -19,8 +19,6 @@ namespace Components
   //   vm_skins [text]                     skins (materials) you can use
   //   vm_skin <material> / vm_skin reset  paint the gun you're holding
   //   vm_reset                            everything back
-  //   vm_handanim <left|right> <anim> [speed]  that arm plays its own anim
-  //   vm_handanim off
   //
   // Engine (iw4x.exe, found by disassembly):
   //   0x4AB212  CG_AddViewWeapon calls 0x59CA90, which fills the view
@@ -121,18 +119,10 @@ namespace Components
 
     struct
     {
-      bool active = false;
-      int arm = 0;              // 0 left, 1 right
-      unsigned int anim = 9;    // WEAP_ANIM_*
-      float speed = 1.0f;
-      float time = 0.0f;
-      int lastMs = 0;
-
       Game::DObj* obj = nullptr;
       Game::XAnimTree_s* tree = nullptr;
       unsigned int weapon = 0;
       Game::XModel* hands = nullptr;
-      unsigned int playing = 0; // anim we set a weight on
       bool drawn = false;       // drawn this frame (hide the arm on the real one)
       bool clip = false;        // Anim Clip drives it (Hand: Left Arm / Right Arm + Gun)
       int builtArm = -1;        // which arm the copy shows
@@ -154,7 +144,6 @@ namespace Components
       handAnim.tree = nullptr;
       handAnim.weapon = 0;
       handAnim.hands = nullptr;
-      handAnim.playing = 0;
       handAnim.drawn = false;
       handAnim.builtArm = -1;
     }
@@ -199,17 +188,6 @@ namespace Components
       std::memset(handAnim.realBits, 0, sizeof(handAnim.realBits));
     }
 
-    float AnimFrequency(void* anims, const unsigned int anim)
-    {
-      if (!anims || anim >= *static_cast<unsigned int*>(anims)) return 0.0f;
-      const auto* entry = reinterpret_cast<std::uint32_t*>(static_cast<std::uint8_t*>(anims) + 4 + anim * 8);
-      const auto* parts = reinterpret_cast<Game::XAnimParts*>(entry[1]);
-      if (!parts) return 0.0f;
-      if (parts->frequency > 0.0f) return parts->frequency;
-      if (parts->numframes > 0 && parts->framerate > 0.0f) return parts->framerate / static_cast<float>(parts->numframes);
-      return 0.0f;
-    }
-
     void* WeaponAnims(const unsigned int weapon)
     {
       const auto base = *reinterpret_cast<std::uintptr_t*>(WEAPON_ANIM_SETS);
@@ -222,7 +200,7 @@ namespace Components
       if (handAnim.why != reason)
       {
         handAnim.why = reason;
-        Logger::Print("vm_handanim: not drawn - {}\n", reason);
+        Logger::Print("animclip arm: not drawn - {}\n", reason);
       }
       return false;
     }
@@ -231,8 +209,8 @@ namespace Components
     bool HandAnimReady()
     {
       handAnim.clip = Weapon::AnimClip_SplitActive();
-      if ((!handAnim.active && !handAnim.clip) || !InGame()) return false;
-      const auto arm = handAnim.clip ? 0 : handAnim.arm; // Anim Clip: the copy is always the left arm
+      if (!handAnim.clip || !InGame()) return false;
+      constexpr auto arm = 0; // the copy is the left arm
 
       // akimbo: that slot is the left gun's
       if (*reinterpret_cast<Game::DObj**>(VIEWMODEL_HANDS + VIEWMODEL_HAND_SIZE)) { HandAnimDrop(); return NotReady("akimbo gun"); }
@@ -263,7 +241,6 @@ namespace Components
         }
         handAnim.weapon = weapon;
         handAnim.hands = hands;
-        handAnim.playing = 0;
         // root blend node on, like the game does for the view model
         XAnimSetGoalWeight(handAnim.obj, 0, 1.0f, 0.0f, 1.0f, 0, 1, 0);
         // the copy only shows the picked arm
@@ -274,36 +251,11 @@ namespace Components
         {
           if (ArmBone(Game::SL_ConvertToString(static_cast<Game::scr_string_t>(hands->boneNames[b])), arm)) ++shown;
         }
-        Logger::Print("vm_handanim: arm copy made for {} ({} bones, {} in the {} arm)\n", hands->name ? hands->name : "?", hands->numBones, shown, arm == 0 ? "left" : "right");
+        Logger::Print("animclip arm: arm copy made for {} ({} bones, {} in the {} arm)\n", hands->name ? hands->name : "?", hands->numBones, shown, arm == 0 ? "left" : "right");
       }
 
-      if (handAnim.clip)
-      {
-        handAnim.why.clear();
-        return true; // Anim Clip (Weapon.cpp) drives the copy's anims
-      }
-
-      if (handAnim.anim >= *static_cast<unsigned int*>(anims) || AnimFrequency(anims, handAnim.anim) <= 0.0f)
-      {
-        return NotReady("this gun doesn't have that anim");
-      }
-
-      if (handAnim.playing != handAnim.anim)
-      {
-        if (handAnim.playing) XAnimSetGoalWeight(handAnim.obj, handAnim.playing, 0.0f, 0.0f, 0.0f, 0, 0, 0);
-        XAnimSetGoalWeight(handAnim.obj, handAnim.anim, 1.0f, 0.0f, 0.0f, 0, 0, 0);
-        handAnim.playing = handAnim.anim;
-      }
-
-      // our own clock, looping
-      const auto now = Game::Sys_Milliseconds();
-      const auto dt = handAnim.lastMs ? std::clamp(now - handAnim.lastMs, 0, 100) : 0;
-      handAnim.lastMs = now;
-      handAnim.time += dt * 0.001f * AnimFrequency(anims, handAnim.anim) * handAnim.speed;
-      handAnim.time -= std::floor(handAnim.time);
-      XAnimSetTime(handAnim.tree, handAnim.anim, std::min(handAnim.time, 0.999f));
       handAnim.why.clear();
-      return true;
+      return true; // Anim Clip (Weapon.cpp) drives the copy's anims
     }
 
     // 0x417542: the view model hands are added to the scene here (entnum 0x7FF
@@ -671,41 +623,6 @@ namespace Components
       }
     });
 
-    Command::Add("vm_handanim", [](const Command::Params* params)
-    {
-      if (params->size() < 2)
-      {
-        Logger::Print("vm_handanim <left|right> <anim 1-36> [speed]  /  vm_handanim off\n");
-        return;
-      }
-      const auto arg = Utils::String::ToLower(params->get(1));
-      if (arg == "off" || arg == "reset")
-      {
-        handAnim.active = false;
-        HandAnimDestroy();
-        ClearRealBits(HandDObj(0));
-        return;
-      }
-      const auto arm = (arg == "right" || arg == "r") ? 1 : 0;
-      const auto anim = params->size() > 2 ? std::atoi(params->get(2)) : 9;
-      if (anim < 1 || anim >= Game::NUM_WEAP_ANIMS)
-      {
-        Logger::Print("vm_handanim: anim must be 1-{}\n", Game::NUM_WEAP_ANIMS - 1);
-        return;
-      }
-      const auto speed = params->size() > 3 ? static_cast<float>(std::atof(params->get(3))) : 1.0f;
-
-      if (arm != handAnim.arm) HandAnimDestroy(); // the copy hides the other arm - rebuild
-      handAnim.arm = arm;
-      handAnim.anim = static_cast<unsigned int>(anim);
-      handAnim.speed = std::clamp(speed, 0.0f, 5.0f);
-      handAnim.time = 0.0f;
-      handAnim.lastMs = 0;
-      handAnim.active = true;
-      handAnim.why.clear();
-      Logger::Print("vm_handanim: {} arm plays anim {} x{}\n", arm == 0 ? "left" : "right", anim, handAnim.speed);
-    });
-
     Command::Add("vm_reset", []
     {
       offset[0] = offset[1] = offset[2] = 0.0f;
@@ -713,13 +630,10 @@ namespace Components
       scale = 1.0f;
       hidden.clear();
       RestoreAll();
-      handAnim.active = false;
-      HandAnimDestroy();
-      ClearRealBits(HandDObj(0));
     });
 
     // weapon indices / models belong to the map
-    Events::OnCLDisconnected([](bool) { RestoreAll(); hidden.clear(); handAnim.active = false; HandAnimDrop(); std::memset(handAnim.realBits, 0, sizeof(handAnim.realBits)); });
-    Events::OnCGameInit([] { RestoreAll(); hidden.clear(); handAnim.active = false; HandAnimDrop(); std::memset(handAnim.realBits, 0, sizeof(handAnim.realBits)); });
+    Events::OnCLDisconnected([](bool) { RestoreAll(); hidden.clear(); HandAnimDrop(); std::memset(handAnim.realBits, 0, sizeof(handAnim.realBits)); });
+    Events::OnCGameInit([] { RestoreAll(); hidden.clear(); HandAnimDrop(); std::memset(handAnim.realBits, 0, sizeof(handAnim.realBits)); });
   }
 }

@@ -555,7 +555,7 @@ namespace Components
     {
       { "checkstate", "!checkstate" }, { "reloadroles", "!reloadroles" },
       { "verify", "!verify" }, { "verified", "!verified" }, { "vip", "!vip" },
-      { "admin", "!admin" }, { "unrole", "!unrole" }, { "longshot", "!longshot" },
+      { "admin", "!admin" }, { "unrole", "!unrole" }, { "longshot", "!longshot" }, { "preset", "!preset" },
     };
 
     for (const auto& names : consoleChatCmds)
