@@ -24,6 +24,7 @@ namespace Components
   const Game::dvar_t* PlayerMovement::PlayerProneSpeedScale;
   const Game::dvar_t* PlayerMovement::BGDisableBarrierClips;
   float PlayerMovement::ProneYawCapOverride[18] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+  float PlayerMovement::LocalProneYawCap = -1.0f;
   const Game::dvar_t* PlayerMovement::BGLadderFixedInput;
   const Game::dvar_t* PlayerMovement::BGSprintIgnoreRepress;
   const Game::dvar_t* PlayerMovement::BGOmnimovement;
@@ -300,14 +301,23 @@ namespace Components
     const auto pmClient = (pm && pm->ps) ? pm->ps->clientNum : -1;
     auto yawSaved = 0.0f;
     auto yawOverridden = false;
-    if (pmClient >= 0 && pmClient < 18 && ProneYawCapOverride[pmClient] >= 0.0f)
+    auto yawCap = -1.0f;
+    if (pmClient >= 0 && pmClient < 18)
+    {
+      if (ProneYawCapOverride[pmClient] >= 0.0f)
+        yawCap = ProneYawCapOverride[pmClient];
+      // our own game predicting us on someone else's server
+      else if (LocalProneYawCap >= 0.0f && !Game::SV_Loaded() && Game::CL_IsCgameInitialized() && Game::cgArray[0].clientNum == pmClient)
+        yawCap = LocalProneYawCap;
+    }
+    if (yawCap >= 0.0f)
     {
       if (!proneYawCap)
         proneYawCap = Game::Dvar_FindVar("bg_prone_yawcap");
       if (proneYawCap)
       {
         yawSaved = proneYawCap->current.value;
-        proneYawCap->current.value = ProneYawCapOverride[pmClient];
+        proneYawCap->current.value = yawCap;
         yawOverridden = true;
       }
     }
@@ -1013,6 +1023,16 @@ namespace Components
     Utils::Hook(0x4E9889, Jump_Check_Stub, HOOK_JUMP).install()->quick();
 
     // Disable player collision with out of bound barriers
+    // OMEN per-player Prone Spins, own game: the server sends omen_proneyaw
+    // (only to players with this dll). -1 = back to normal. Cleared when
+    // leaving a server / loading a map; the server sends it again on spawn.
+    Command::Add("omen_proneyaw", [](const Command::Params* params)
+    {
+      LocalProneYawCap = params->size() < 2 ? -1.0f : static_cast<float>(std::atof(params->get(1)));
+    });
+    Events::OnCLDisconnected([](bool) { LocalProneYawCap = -1.0f; });
+    Events::OnCGameInit([] { LocalProneYawCap = -1.0f; });
+
     Utils::Hook(0x4CFF5C, PmoveSingle_Stub, HOOK_CALL).install()->quick();          // single PmoveSingle call inside Pmove
     Utils::Hook(0x574AF4, PM_CheckLadderMove_Stub, HOOK_CALL).install()->quick();   // single PM_CheckLadderMove call inside PmoveSingle
 

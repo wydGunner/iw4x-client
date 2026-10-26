@@ -10,6 +10,9 @@ namespace Components
     // OMEN per-player prone turn limit (server side, set from GSC via
     // setProneYawCap). < 0 = use bg_prone_yawcap like everyone else.
     static float ProneYawCapOverride[18];
+    // Own game (dll players): omen_proneyaw <deg | -1> from the server, so
+    // this player's prediction uses the same limit the server gives them.
+    static float LocalProneYawCap;
 
   private:
     enum BouncesSettings : int { DISABLED, ENABLED, DOUBLE };
