@@ -625,6 +625,37 @@ namespace Components
 				}
 			});
 
+		// self setWeaponState(<state>[, <weaponTime ms>]);  server side, both hands.
+		// 0 = ready, 1 = raising ... (weaponstate_t). Used by the OMEN canswap
+		// "Canshoot": after the shot, put the gun back to raising so the game
+		// still holds a second weapon switch until the raise is done.
+		GSC::Script::AddMethod("SetWeaponState", [](const Game::scr_entref_t entref)
+			{
+				auto* ent = GSC::Script::Scr_GetPlayerEntity(entref);
+				const auto state = Game::Scr_GetInt(0);
+				const auto hasTime = Game::Scr_GetNumParam() > 1;
+				const auto time = hasTime ? Game::Scr_GetInt(1) : 0;
+				for (auto& ws : ent->client->ps.weapState)
+				{
+					ws.weaponState = state;
+					if (hasTime)
+						ws.weaponTime = time;
+				}
+			});
+
+		// state = self getWeaponState();   time = self getWeaponTime();  (right hand)
+		GSC::Script::AddMethod("GetWeaponState", [](const Game::scr_entref_t entref)
+			{
+				const auto* ent = GSC::Script::Scr_GetPlayerEntity(entref);
+				Game::Scr_AddInt(ent->client->ps.weapState[Game::WEAPON_HAND_RIGHT].weaponState);
+			});
+
+		GSC::Script::AddMethod("GetWeaponTime", [](const Game::scr_entref_t entref)
+			{
+				const auto* ent = GSC::Script::Scr_GetPlayerEntity(entref);
+				Game::Scr_AddInt(ent->client->ps.weapState[Game::WEAPON_HAND_RIGHT].weaponTime);
+			});
+
 		// ---------------------------------------------------------------------
 		// weapdef_* functions, restored from the same older custom build.
 		// They edit the loaded weapon definition for EVERY player using that
