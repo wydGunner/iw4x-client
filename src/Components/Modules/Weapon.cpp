@@ -2,6 +2,7 @@
 
 #include "GSC/Script.hpp"
 #include "Events.hpp"
+#include "PlayerMovement.hpp"
 #include "ClientCommand.hpp"
 
 namespace Components
@@ -641,6 +642,16 @@ namespace Components
 					if (hasTime)
 						ws.weaponTime = time;
 				}
+			});
+
+		// self setProneYawCap(<degrees>);  per-player prone turn limit, server
+		// side (PlayerMovement::PmoveSingle_Stub). -1 = back to bg_prone_yawcap.
+		GSC::Script::AddMethod("SetProneYawCap", [](const Game::scr_entref_t entref)
+			{
+				const auto* ent = GSC::Script::Scr_GetPlayerEntity(entref);
+				const auto num = ent->s.number;
+				if (num >= 0 && num < 18)
+					PlayerMovement::ProneYawCapOverride[num] = Game::Scr_GetFloat(0);
 			});
 
 		// state = self getWeaponState();   time = self getWeaponTime();  (right hand)

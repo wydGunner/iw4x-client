@@ -23,6 +23,7 @@ namespace Components
   const Game::dvar_t* PlayerMovement::PlayerDuckedSpeedScale;
   const Game::dvar_t* PlayerMovement::PlayerProneSpeedScale;
   const Game::dvar_t* PlayerMovement::BGDisableBarrierClips;
+  float PlayerMovement::ProneYawCapOverride[18] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
   const Game::dvar_t* PlayerMovement::BGLadderFixedInput;
   const Game::dvar_t* PlayerMovement::BGSprintIgnoreRepress;
   const Game::dvar_t* PlayerMovement::BGOmnimovement;
@@ -293,10 +294,31 @@ namespace Components
       }
     }
 
+    // OMEN per-player Prone Spins: this player's own prone turn limit for
+    // just this move, then the lobby value goes back (2026-10-26)
+    static Game::dvar_t* proneYawCap = nullptr;
+    const auto pmClient = (pm && pm->ps) ? pm->ps->clientNum : -1;
+    auto yawSaved = 0.0f;
+    auto yawOverridden = false;
+    if (pmClient >= 0 && pmClient < 18 && ProneYawCapOverride[pmClient] >= 0.0f)
+    {
+      if (!proneYawCap)
+        proneYawCap = Game::Dvar_FindVar("bg_prone_yawcap");
+      if (proneYawCap)
+      {
+        yawSaved = proneYawCap->current.value;
+        proneYawCap->current.value = ProneYawCapOverride[pmClient];
+        yawOverridden = true;
+      }
+    }
+
     // OMEN Riot Shield Prone: tell the blocksProne check whose move this is
-    Weapon::RiotProne_SetPmClient((pm && pm->ps) ? pm->ps->clientNum : -1);
+    Weapon::RiotProne_SetPmClient(pmClient);
     Game::PMoveSingle(pm);
     Weapon::RiotProne_SetPmClient(-1);
+
+    if (yawOverridden)
+      proneYawCap->current.value = yawSaved;
   }
 
 

@@ -7,6 +7,10 @@ namespace Components
   public:
     PlayerMovement();
 
+    // OMEN per-player prone turn limit (server side, set from GSC via
+    // setProneYawCap). < 0 = use bg_prone_yawcap like everyone else.
+    static float ProneYawCapOverride[18];
+
   private:
     enum BouncesSettings : int { DISABLED, ENABLED, DOUBLE };
 
