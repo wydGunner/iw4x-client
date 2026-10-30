@@ -1388,6 +1388,14 @@ namespace Components
 		const Game::dvar_t* animClipMixGame = nullptr;
 		const Game::dvar_t* animClipKnifeCancel = nullptr;
 		const Game::dvar_t* animClipSwapCancel = nullptr;
+
+		// Knife / swap cancel only counts a knife or swap that STARTS while a
+		// clip plays. A clip started during a knife's recovery (or mid-swap)
+		// used to be stopped on its very first frame, so the bind needed a
+		// second press. Cleared when a clip starts, set again on the first
+		// frame the gun isn't knifing / swapping. (2026-10-29)
+		bool animClipKnifeArmed = false;
+		bool animClipSwapArmed = false;
 		const Game::dvar_t* animClipDebug = nullptr;
 
 		bool ClipDebug()
@@ -1535,6 +1543,8 @@ namespace Components
 		layer.startedAt = Game::Sys_Milliseconds();
 		layer.lastTick = Game::CL_IsCgameInitialized() ? Game::cgArray[0].time : layer.startedAt;
 		layer.active = true;
+		animClipKnifeArmed = false;
+		animClipSwapArmed = false;
 
 		if (ClipDebug())
 		{
@@ -1634,7 +1644,12 @@ namespace Components
 		// Knife / throwing knife / grenade cuts every clip so the real move
 		// shows (animclip_knifecancel 1, default) - lets a clip lead straight
 		// into a knife or a throw mid-shot.
-		if (hand == 0 && animClipKnifeCancel && animClipKnifeCancel->current.enabled && KnifeOrThrow(ps))
+		const auto knifing = (hand == 0) && KnifeOrThrow(ps);
+		const auto swapping = (hand == 0) && Swapping(ps);
+		if (hand == 0 && !knifing) animClipKnifeArmed = true;
+		if (hand == 0 && !swapping) animClipSwapArmed = true;
+
+		if (hand == 0 && animClipKnifeCancel && animClipKnifeCancel->current.enabled && knifing && animClipKnifeArmed)
 		{
 			if (ClipDebug())
 				Logger::Print("animclip dbg {}: knife/throw cancel (game state {}, anim {})\n", now, ps->weapState[Game::WEAPON_HAND_RIGHT].weaponState, ps->weapState[Game::WEAPON_HAND_RIGHT].weapAnim);
@@ -1644,7 +1659,7 @@ namespace Components
 
 		// Swapping weapons (Y / YY) cuts every clip too - its own toggle,
 		// animclip_swapcancel, since some clips swap on purpose (2026-10-19)
-		if (hand == 0 && animClipSwapCancel && animClipSwapCancel->current.enabled && Swapping(ps))
+		if (hand == 0 && animClipSwapCancel && animClipSwapCancel->current.enabled && swapping && animClipSwapArmed)
 		{
 			if (ClipDebug())
 				Logger::Print("animclip dbg {}: swap cancel (game state {})\n", now, ps->weapState[Game::WEAPON_HAND_RIGHT].weaponState);
